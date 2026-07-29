@@ -808,6 +808,15 @@ class ClsVJEPA(nn.Module):
         # ---- Layout-agnostic setup ------------------------------------------
         self._is_swin = isinstance(encoder, SwinEncoder)
 
+        # SwinEncoder always creates proj_norm + proj + proj_drop for its
+        # return_patches=False path, but ClsVJEPA only ever calls it with
+        # return_patches=True (it provides its own bn + lin1 projection).
+        # Drop the dead layers so parameter counts and memory match reality.
+        if self._is_swin:
+            for _attr in ("proj_norm", "proj", "proj_drop"):
+                if hasattr(encoder, _attr):
+                    delattr(encoder, _attr)
+
         # V-JEPA spatial-grid mode: keep patch tokens, pool spatially (like Swin).
         # Applies to ALL temporal models — it's an encoder-postprocessing step.
         # e.g. vjepa_spatial_grid=[6, 6] pools 24×24×2 → 6×6×1 = 36 grid cells.

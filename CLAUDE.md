@@ -14,7 +14,7 @@ This is **MOVAD + V-JEPA 2.1**: a supervised anomaly detection pipeline for traf
 ## Architecture and data flow
 
 ```
-DoTA video (256×256, 10 FPS)
+DoTA video (384x384, 10 FPS)
     ↓ buffer NF-frame sliding-window clips (stride-1)
 V-JEPA 2.1 ViT encoder (frozen, no grad)
     ↓
@@ -41,7 +41,7 @@ V-JEPA 2.1 ViT encoder (frozen, no grad)
 | File | Purpose |
 |------|---------|
 | `main.py` | Entry point: CLI parsing, training loop, testing loop |
-| `model.py` | `ClsVJEPA` + all temporal model variants + `MambaCache` + inverted `MultiHeadAttention` + `build_cls_vjepa` factory |
+| `model.py` | `ClsVJEPA` + all temporal model variants + `MambaCache` + `build_cls_vjepa` factory |
 | `vjepa_encoder.py` | Frozen V-JEPA 2.1 encoder wrapper; handles the `src` package name collision during import, loads pretrained weights, exposes `(clip) → features` interface |
 | `movad_core/dota.py` | DoTA dataset class, annotation loading, sub-batch sampling, data transforms |
 | `movad_core/losses.py` | Weighted cross-entropy loss builder |
@@ -61,15 +61,13 @@ Everything is driven by YAML configs in `cfgs/`. Configs are loaded via `easydic
 | `vjepa_v1.yaml` | LSTM | ~27.3M | Baseline — original MOVAD design with V-JEPA backbone |
 | `vjepa_mamba.yaml` | Mamba2 | ~21.9M | 3 Mamba2 blocks, d=1024, expand=2 |
 | `vjepa_slotssm.yaml` | SlotSSM (dense) | ~19.0M | K=32, D=512, 4 blocks, standard cross-attn |
-| `vjepa_slotssm_inv.yaml` | SlotSSM (inverted) | ~19.0M | Inverted cross-attn — features compete for slots |
 | `vjepa_sparse_slotssm.yaml` | Sparse SlotSSM | ~19.0M | top_k=16, entropy reg + ε-random |
-| `vjepa_sparse_slotssm_inv.yaml` | Sparse SlotSSM (inverted) | ~19.0M | Sparse + inverted cross-attn |
 
 ### Config keys for temporal models
 
 Common: `temporal_model`, `dim_latent`, `dropout`, `rnn_cell_num`
 Mamba-specific: `mamba_d_state`, `mamba_d_conv`, `mamba_expand`, `mamba_version` (always `"mamba2"`)
-SlotSSM-specific: `num_slots`, `slot_dim`, `num_ssm_blocks`, `top_k`, `eps_random`, `use_inverted_attention`
+SlotSSM-specific: `num_slots`, `slot_dim`, `num_ssm_blocks`, `top_k`, `eps_random`
 Sparse-only (training): `entropy_weight` (CLI-level, controls gate entropy penalty in training loop)
 Encoder: `model_name` (vit_base/vit_large/vit_giant_xformers), `num_frames`, `img_size`, `checkpoint_path`, `compile`
 
@@ -193,7 +191,6 @@ The code gracefully degrades: `_HAS_MAMBA_SSM` and `_HAS_FLASH_ATTN` flags contr
 - Weighted cross-entropy: normal=0.3, anomaly=0.7.
 - State is carried across timesteps: LSTM tuples `(h, c)`, Mamba uses `MambaCache`.
 - Sparse SlotSSM entropy penalty is added directly to the per-frame loss in the training loop (not inside the model).
-- Slot diagnostics (mass_min, mass_mean, usage_frac) are logged to TensorBoard for inverted attention models.
 - **Checkpoints**: `model.heads[name].state_dict()` is filtered to exclude the frozen encoder (saves ~600MB per ckpt per head). Only temporal + classifier weights are stored. `MultiHeadVJEPA.train()` overrides the default behavior — heads follow the requested mode but the encoder is always pinned to `eval()`.
 - Checkpoints save at `cfg.snapshot_interval` epochs to `{cfg.output}/checkpoints/model-{epoch:02d}.pt`.
 - **Validation during training**: runs every `validation_epoch_step` epochs (default 10, clamped to `--epochs` so it runs at least once). Uses the same `_evaluate_model()` code path as standalone testing — one encode for all heads, then each head evaluated independently. Metrics logged to TensorBoard under `val/auc_roc`, `val/auc_pr`, `val/f1`, `val/f1_mean`, `val/accuracy`.
@@ -212,10 +209,6 @@ All temporal models must support the `(x, state) → (output, new_state)` interf
 - **LSTM**: state is `(h, c)` tuple; both detached after each step.
 - **Mamba/Mamba2**: state is a `MambaCache` with `seqlen_offset` and `key_value_memory_dict` tracking per-layer conv/SSM states.
 - **SlotSSM/Sparse SlotSSM**: state is a `MambaCache`; slot values themselves are read/written within the forward pass (not stored in state).
-
-## Inverted cross-attention
-
-When `use_inverted_attention: true`, the cross-attention softmax runs over the (head × slot) dimension instead of the feature dimension. This forces input patch tokens to compete for slot assignment — a soft partitioning mechanism. Uses the eager `MultiHeadAttention` class from `model.py` (single head by default, matching the SlotSSM reference repo). Diagnostics (`_slot_mass_min`, `_slot_mass_mean`, `_slot_usage_frac`) track slot health — if `mass_min` trends below 0.05, a slot is nearly dead.
 
 ## Sparse SlotSSM gating
 
