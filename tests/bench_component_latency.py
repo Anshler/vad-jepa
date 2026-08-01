@@ -41,7 +41,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import time
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -95,23 +94,14 @@ def load_cfg(name: str) -> EasyDict:
     return cfg
 
 
-def gpu_timer():
-    """Return start/stop CUDA events and a sync function."""
-    start = torch.cuda.Event(enable_timing=True)
-    stop = torch.cuda.Event(enable_timing=True)
-    return start, stop
+def make_event():
+    return torch.cuda.Event(enable_timing=True)
 
 
 # ===========================================================================
-# Component-level forward runner — avoids hooks by calling submodules directly
+# Component-level forward runner
 # ===========================================================================
 class ComponentTimer:
-    """Times each component of ClsVJEPA separately by re-executing the
-    forward pass with instrumentation around each submodule call.
-
-    We use torch.cuda.Event (GPU-side) for precision and synchronize between
-    components so their timings don't overlap.
-    """
 
     def __init__(self, model: ClsVJEPA, amp_dtype=None):
         self.model = model
@@ -122,115 +112,91 @@ class ComponentTimer:
         self._has_spatial_grid = model._use_spatial_grid
         self._state = None
 
-    def _time_call(self, fn, *args, **kwargs):
-        torch.cuda.synchronize()
-        s = torch.cuda.Event(enable_timing=True)
-        e = torch.cuda.Event(enable_timing=True)
-        s.record()
+    def _record_call(self, fn, ev_start, ev_end, *args, **kwargs):
+        """Call ``fn(*args, **kwargs)`` bracketed by two CUDA events."""
+        ev_start.record()
         with torch.no_grad(), self.ctx:
             out = fn(*args, **kwargs)
-        e.record()
-        torch.cuda.synchronize()
-        return out, s.elapsed_time(e)
+        ev_end.record()
+        return out
 
     def __call__(self, x: torch.Tensor):
-        """Run full forward and return ``{name: ms, ...}`` dict."""
+        """Run full forward, return ``{name: ms, ...}`` dict.
+
+        CUDA events are recorded per-component without intermediate syncs.
+        A single ``torch.cuda.synchronize()`` at the end reads all times.
+        """
         times = {}
         m = self.model
+        ev = {}  # name -> (start_event, end_event)
+
+        torch.cuda.synchronize()
 
         # ---------------------------------------------------------------
         # 1. Encoder
         # ---------------------------------------------------------------
+        s, e = make_event(), make_event()
+        ev["encoder"] = (s, e)
         if self._is_slot or self._is_swin or self._has_spatial_grid:
-            z, dt = self._time_call(m.encoder, x, return_patches=True)  # [B, N, D]
+            z = self._record_call(m.encoder, s, e, x, return_patches=True)
         else:
-            z, dt = self._time_call(m.encoder, x)  # [B, D]
-        times["encoder"] = dt
+            z = self._record_call(m.encoder, s, e, x)
 
         # ---------------------------------------------------------------
         # 2. Spatial Conv (V-JEPA spatial grid only)
         # ---------------------------------------------------------------
         if self._has_spatial_grid and not self._is_swin:
+            s, e = make_event(), make_event()
+            ev["spatial_conv"] = (s, e)
             patch_tokens = z.clone() if self._is_slot else z
             with torch.no_grad(), self.ctx:
-                torch.cuda.synchronize()
-                s = torch.cuda.Event(enable_timing=True)
-                e = torch.cuda.Event(enable_timing=True)
                 s.record()
                 pooled = m._spatial_pool_tokens(patch_tokens, m._vjepa_n_temp)
                 e.record()
-                torch.cuda.synchronize()
-                dt_pool = s.elapsed_time(e)
-            times["spatial_conv"] = dt_pool
-
             if self._is_slot:
                 z = pooled
             else:
                 z = pooled.reshape(x.shape[0], -1)
         else:
-            times["spatial_conv"] = 0.0
+            ev["spatial_conv"] = None
 
         # ---------------------------------------------------------------
         # 3. Projection (bn → lin1 → drop) — non-slot only
         # ---------------------------------------------------------------
         if not self._is_slot:
-            # Swin: z is [B, N, D] from encoder — flatten before bn
-            if self._is_swin:
-                with torch.no_grad(), self.ctx:
-                    torch.cuda.synchronize()
-                    s = torch.cuda.Event(enable_timing=True)
-                    e = torch.cuda.Event(enable_timing=True)
-                    s.record()
+            s, e = make_event(), make_event()
+            ev["projection"] = (s, e)
+            with torch.no_grad(), self.ctx:
+                s.record()
+                if self._is_swin:
                     h = z.transpose(1, 2).flatten(1)
-                    h = m.bn(h)
-                    h = F.relu(m.lin1(h))
-                    h = m.drop(h)
-                    e.record()
-                    torch.cuda.synchronize()
-                    dt_proj = s.elapsed_time(e)
-            else:
-                with torch.no_grad(), self.ctx:
-                    torch.cuda.synchronize()
-                    s = torch.cuda.Event(enable_timing=True)
-                    e = torch.cuda.Event(enable_timing=True)
-                    s.record()
-                    h = m.bn(z)
-                    h = F.relu(m.lin1(h))
-                    h = m.drop(h)
-                    e.record()
-                    torch.cuda.synchronize()
-                    dt_proj = s.elapsed_time(e)
-            times["projection"] = dt_proj
+                else:
+                    h = z
+                h = m.bn(h)
+                h = F.relu(m.lin1(h))
+                h = m.drop(h)
+                e.record()
         else:
-            times["projection"] = 0.0
+            ev["projection"] = None
 
         # ---------------------------------------------------------------
         # 4. Temporal model
         # ---------------------------------------------------------------
-        if self._is_slot:
-            inp = z  # patch tokens (post spatial pool if set)
-        else:
-            inp = h  # post-projection features
-
+        s, e = make_event(), make_event()
+        ev["temporal"] = (s, e)
+        inp = z if self._is_slot else h
         with torch.no_grad(), self.ctx:
-            torch.cuda.synchronize()
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
             s.record()
             slots_or_feats, self._state = m.temporal(inp, self._state)
             e.record()
-            torch.cuda.synchronize()
-            dt_temp = s.elapsed_time(e)
-        times["temporal"] = dt_temp
 
         # ---------------------------------------------------------------
         # 5. Classifier (slot-attn + MLP or lin2 + lin3)
         # ---------------------------------------------------------------
+        s, e = make_event(), make_event()
+        ev["classifier"] = (s, e)
         if self._is_slot:
             with torch.no_grad(), self.ctx:
-                torch.cuda.synchronize()
-                s = torch.cuda.Event(enable_timing=True)
-                e = torch.cuda.Event(enable_timing=True)
                 s.record()
                 D = slots_or_feats.shape[-1]
                 scores = (slots_or_feats * m.slot_query).sum(dim=-1) / (D ** 0.5)
@@ -238,21 +204,24 @@ class ComponentTimer:
                 pooled = (attn.unsqueeze(-1) * slots_or_feats).sum(dim=1)
                 logits = m.classifier(pooled)
                 e.record()
-                torch.cuda.synchronize()
-                dt_cls = s.elapsed_time(e)
         else:
             with torch.no_grad(), self.ctx:
-                torch.cuda.synchronize()
-                s = torch.cuda.Event(enable_timing=True)
-                e = torch.cuda.Event(enable_timing=True)
                 s.record()
                 logits = F.relu(m.lin2(slots_or_feats))
                 logits = m.drop(logits)
                 logits = m.lin3(logits)
                 e.record()
-                torch.cuda.synchronize()
-                dt_cls = s.elapsed_time(e)
-        times["classifier"] = dt_cls
+
+        # ---------------------------------------------------------------
+        # Single sync → read all times
+        # ---------------------------------------------------------------
+        torch.cuda.synchronize()
+
+        for name, se in ev.items():
+            if se is None:
+                times[name] = 0.0
+            else:
+                times[name] = se[0].elapsed_time(se[1])
 
         times["total"] = sum(v for v in times.values())
         return times
@@ -363,7 +332,7 @@ def plot_results(results: list[tuple], output_path: str):
 
 # ===========================================================================
 parser = argparse.ArgumentParser(
-    description="Component-level latency benchmark for MOVAD temporal variants"
+    description="Component-level latency benchmark for temporal variants"
 )
 parser.add_argument("--amp", default=_DEFAULT_AMP, choices=list(_AMP_CHOICES),
                     help=f"AMP dtype (default: {_DEFAULT_AMP})")

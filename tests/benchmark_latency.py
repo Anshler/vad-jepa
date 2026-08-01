@@ -60,21 +60,29 @@ def load_cfg(name):
     return cfg
 
 
+def _warmup_steps(total):
+    return min(30, total // 3)
+
+
 def measure_latency(model, x, steps, amp_dtype=None):
-    torch.cuda.synchronize()
-    times = []
+    warmup = _warmup_steps(steps)
+    measure_n = steps - warmup
     state = None
     ctx = torch.amp.autocast("cuda", dtype=amp_dtype) if amp_dtype else nullcontext()
-    for i in range(steps):
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
+
+    for _ in range(warmup):
         with torch.no_grad(), ctx:
             _, state = model(x, state)
-        torch.cuda.synchronize()
-        dt = (time.perf_counter() - t0) * 1000
-        if i >= WARMUP:
-            times.append(dt)
-    return sorted(times)[len(times) // 2]
+
+    state = None
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(measure_n):
+        with torch.no_grad(), ctx:
+            _, state = model(x, state)
+    torch.cuda.synchronize()
+    dt = (time.perf_counter() - t0) * 1000
+    return dt / measure_n
 
 
 # ===========================================================================
