@@ -3,7 +3,7 @@ Quick validation of a loaded checkpoint on a small subset of test data.
 
 Usage (WSL):
     conda activate vjepa2-312
-    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad
+    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vad-jepa
 
     # Swin+LSTM (remapped MOVAD checkpoint)
     python tests/quick_val.py --config cfgs/swin_lstm.yaml \

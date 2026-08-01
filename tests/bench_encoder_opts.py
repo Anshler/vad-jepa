@@ -71,9 +71,6 @@ if __name__ == "__main__":
     print(f"Warmup={WARM}  Measure={MEAS}  Batch=1")
     print("All configs: torch.compile(reduce-overhead) on encoder\n")
 
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
-
     results = []
 
     configs = [

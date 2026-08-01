@@ -3,7 +3,7 @@ Verify parameter counts — detailed hierarchical breakdown.
 
 Usage (from WSL):
     conda activate vjepa2-312
-    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad
+    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vad-jepa
     python tests/verify_params.py
     python tests/verify_params.py --cfg cfgs/vjepa_v1.yaml
     python tests/verify_params.py --all

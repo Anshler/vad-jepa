@@ -7,7 +7,7 @@ old save/restore path (ran Mamba on all slots then cloned back inactive states).
 
 Run from WSL:
     conda activate vjepa2-312
-    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad
+    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vad-jepa
     python tests/test_sparse_mamba.py
 """
 from __future__ import annotations

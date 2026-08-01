@@ -7,7 +7,7 @@ will be identical bit-for-bit. Any randomly-initialized parameter will differ.
 
 Usage (from WSL):
     conda activate vjepa2-312
-    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad
+    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vad-jepa
     python tests/verify_swin_checkpoint.py
 """
 

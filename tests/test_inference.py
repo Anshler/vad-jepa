@@ -4,7 +4,7 @@ using the pretrained V-JEPA 2.1 ViT-B checkpoint when available.
 
 Usage (from WSL):
     conda activate vjepa2-312
-    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad
+    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vad-jepa
     python tests/test_inference.py
     python tests/test_inference.py --amp fp16
     python tests/test_inference.py --amp bf16

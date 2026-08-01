@@ -10,7 +10,7 @@ Verifies:
 
 Usage (from WSL):
     conda activate vjepa2-312
-    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad
+    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vad-jepa
     python tests/test_training.py
     python tests/test_training.py --config swin_lstm.yaml
     python tests/test_training.py --amp fp16
