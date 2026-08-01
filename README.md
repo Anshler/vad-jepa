@@ -234,7 +234,7 @@ This project combines original code with components from several open-source pro
 | Component | Source | License |
 |-----------|--------|---------|
 | MOVAD dataset loader, metrics | [MOVAD](https://github.com/hachreak/movad) | GPL v2 |
-| V-JEPA 2.1 encoder | [Facebook Research](https://github.com/facebookresearch/vjepa2) | MIT |
+| V-JEPA 2.1 encoder | [VJEPA2](https://github.com/facebookresearch/vjepa2) | MIT |
 | Slot SSM blocks | [SlotSSMs](https://github.com/JindongJiang/SlotSSMs) | MIT |
 | Original contributions | This work | MIT (when separate) |
 
