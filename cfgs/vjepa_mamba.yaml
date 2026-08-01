@@ -11,10 +11,9 @@ img_size: 384
 num_frames: 4
 tubelet_size: 2
 patch_size: 16
-checkpoint_path: null
+checkpoint_path: ./pretrained/vjepa2_1_vitb_dist_vitG_384.pt
 checkpoint_key: ema_encoder
 vjepa_spatial_grid: [6, 6]
-pool: mean
 compile: false
 
 # --- Temporal model -------------------------------------------------------
@@ -32,7 +31,7 @@ NF: 4
 VCL: 8
 
 data_mean: [0.5, 0.5, 0.5]
-data_path: null
+data_path: ./data/dota
 data_std: [0.5, 0.5, 0.5]
 dataset: Dota
 image_shape: [720, 1280]
@@ -40,10 +39,10 @@ input_shape: [384, 384]
 FPS: 10
 
 # --- Training -------------------------------------------------------------
-batch_size: 2
+batch_size: 32
 class_weights: [0.3, 0.7]
 epochs: 200
-lr: 0.0001
+lr: 0.00005
 snapshot_interval: 10
 enable_validation: true
 validation_epoch_step: 10

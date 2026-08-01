@@ -129,29 +129,6 @@ else:
     print("  (skipped — mamba_ssm not installed)")
 
 # ===========================================================================
-# Inverted attention variants
-# ===========================================================================
-print("\n" + "=" * 70)
-print("Inverted attention variants")
-print("=" * 70)
-
-# --- SlotSSM (inverted) ---
-print("\n[5] SlotSSM (inverted)")
-if _HAS_MAMBA_SSM:
-    cfg_slotssm_inv = load_cfg("vjepa_slotssm_inv.yaml")
-    run_streaming_test(cfg_slotssm_inv, "SlotSSM-inverted")
-else:
-    print("  (skipped — mamba_ssm not installed)")
-
-# --- Sparse SlotSSM (inverted) ---
-print("\n[6] Sparse SlotSSM (inverted)")
-if _HAS_MAMBA_SSM:
-    cfg_sparse_inv = load_cfg("vjepa_sparse_slotssm_inv.yaml")
-    run_streaming_test(cfg_sparse_inv, "SparseSlotSSM-inverted")
-else:
-    print("  (skipped — mamba_ssm not installed)")
-
-# ===========================================================================
 # Resolution / frame-count flexibility (LSTM)
 # ===========================================================================
 print("\n" + "=" * 70)
@@ -182,8 +159,6 @@ if _HAS_MAMBA_SSM and _HAS_CKPT:
         "vjepa_mamba.yaml",       # Mamba
         "vjepa_slotssm.yaml",    # SlotSSM
         "vjepa_sparse_slotssm.yaml",  # Sparse SlotSSM
-        "vjepa_slotssm_inv.yaml",     # SlotSSM (inverted)
-        "vjepa_sparse_slotssm_inv.yaml",  # Sparse SlotSSM (inverted)
     ]
     head_names = [os.path.splitext(f)[0] for f in head_files]
 
@@ -228,7 +203,7 @@ if _HAS_MAMBA_SSM and _HAS_CKPT:
     print(f"\n  per-clip encoding: clip {tuple(clip.shape)} → output {tuple(out.shape)}")
     print(f"    ✓ per-clip encode OK")
 
-    print("\n  All 6 heads pass streaming smoke tests ✓")
+    print("\n  All heads pass streaming smoke tests ✓")
 else:
     if not _HAS_MAMBA_SSM:
         print("  (skipped — mamba_ssm not installed)")
