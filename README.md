@@ -63,9 +63,6 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 - **First systematic study** of V-JEPA representations for online traffic video anomaly detection
 - **SG-SlotSSM** — a novel sparse-gated slot-based state-space memory that freezes inactive slots for persistent long-term memory, with ε-greedy routing and entropy regularization
 - **V-JEPA +7.4 AUC** over supervised Swin-B at the encoder-only level (81.9% vs. 74.5%)
-- **Multi-head training** — one frozen encoder, multiple independent temporal heads trained simultaneously
-- **SlotSSM variants are 3× smaller** than LSTM/Mamba — they avoid the 28M pre-projection bottleneck by projecting grid tokens directly to slot dimension
-- **18.5M** (SlotSSM/SG-SlotSSM) vs. **49–55M** (Mamba/LSTM) trainable non-encoder params
 
 ---
 
@@ -238,23 +235,12 @@ This project combines original code with components from several open-source pro
 |-----------|--------|---------|
 | MOVAD dataset loader, metrics | [MOVAD](https://github.com/hachreak/movad) | GPL v2 |
 | V-JEPA 2.1 encoder | [Facebook Research](https://github.com/facebookresearch/vjepa2) | MIT |
-| Mamba/Mamba2 SSM blocks | [SlotSSMs](https://github.com/JindongJiang/SlotSSMs) | MIT |
+| Slot SSM blocks | [SlotSSMs](https://github.com/JindongJiang/SlotSSMs) | MIT |
 | Original contributions | This work | MIT (when separate) |
 
 See [`NOTICE`](NOTICE) for full attribution.
 
 ---
-
-## Citation
-
-```bibtex
-@misc{vad-jepa,
-  title={VAD-JEPA: Slot-Memory-Augmented Online Video Anomaly Detection With JEPA},
-  author={Huynh Minh Triet and Anshler},
-  year={2025},
-  note={Under review}
-}
-```
 
 <p align="center">
   <sub>Built with <a href="https://github.com/facebookresearch/vjepa2">V-JEPA 2.1</a>, <a href="https://github.com/state-spaces/mamba">Mamba</a>, and <a href="https://github.com/JindongJiang/SlotSSMs">SlotSSMs</a>.</sub>
