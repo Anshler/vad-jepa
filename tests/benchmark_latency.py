@@ -93,8 +93,6 @@ print(f"GPU: {gpu_name}  ({mem_gb:.1f} GB)")
 print(f"Target: <= {1000 / TARGET_FPS:.0f} ms/step for {TARGET_FPS} FPS online")
 print(f"ViT-B + torch.compile  |  {amp_tag}  |  WARMUP={WARMUP}  MEASURE={MEASURE}  Batch={B}\n")
 
-torch.backends.cuda.matmul.allow_tf32 = True
-
 print(f"{'Model':<22} {'Total':>8}  {'FPS':>7}  {'RT?':>5}")
 print(f"{'-'*22} {'-'*8}  {'-'*7}  {'-'*5}")
 
