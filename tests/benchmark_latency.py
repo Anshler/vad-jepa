@@ -4,7 +4,7 @@ Uses AMP fp16 by default (configurable via --amp flag or AMP_DTYPE env var).
 
 Usage (from WSL):
     conda activate vjepa2-312
-    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad
+    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vad-jepa
     python tests/benchmark_latency.py
     python tests/benchmark_latency.py --amp fp32
     python tests/benchmark_latency.py --checkpoint ~/vjepa2-checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
@@ -45,11 +45,10 @@ _DEFAULT_AMP = os.environ.get("AMP_DTYPE", "fp32")
 
 CONFIGS = [
     ("vjepa_v1.yaml",                "LSTM"),
+    ("vjepa_linear_probe.yaml",      "None"),
     ("vjepa_mamba.yaml",             "Mamba"),
     ("vjepa_slotssm.yaml",           "SlotSSM"),
-    ("vjepa_slotssm_inv.yaml",       "SlotSSM-inv"),
     ("vjepa_sparse_slotssm.yaml",    "SpSlotSSM"),
-    ("vjepa_sparse_slotssm_inv.yaml","SpSlotSSM-inv"),
 ]
 
 
@@ -102,7 +101,7 @@ print(f"{'-'*22} {'-'*8}  {'-'*7}  {'-'*5}")
 for name, tag in CONFIGS:
     if not _HAS_MAMBA_SSM and "mamba" in name:
         continue
-    if not _HAS_MAMBA_SSM and name not in ("vjepa_v1.yaml",):
+    if not _HAS_MAMBA_SSM and name not in ("vjepa_v1.yaml", "vjepa_linear_probe.yaml"):
         continue
 
     cfg = load_cfg(name)

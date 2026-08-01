@@ -1,5 +1,5 @@
 """
-Swin Transformer 3D encoder for vjepa_movad — MOVAD paper parity.
+Swin Transformer 3D encoder for vad-jepa — MOVAD paper parity.
 
 Architecture matches the MOVAD paper (Video Swin-B + AdaptiveAvgPool3d projection):
     Swin → AdaptiveAvgPool3d((1,6,6)) → [B, C, 1, 6, 6]

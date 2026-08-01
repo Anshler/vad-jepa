@@ -1,7 +1,7 @@
-vjepa_movad NOTICE
+vad-jepa NOTICE
 ==================
 
-This project combines original code with components from several open-source
+This project contains original code and adapted components from open-source
 projects.  The combined work is distributed under the GNU General Public
 License v2 (see LICENSE file).
 
@@ -16,20 +16,26 @@ Third-party components
     These files originate from the MOVAD anomaly detection project and are
     the reason the combined work is GPL v2 (§2b).
 
-2.  V-JEPA 2 / V-JEPA 2.1 (https://github.com/facebookresearch/vjepa2)
-    Files:  vjepa_encoder.py and any V-JEPA model weights / code adapted
-            from the Meta V-JEPA repository.
-    License:  MIT — Copyright (c) Meta Platforms, Inc. and affiliates.
-
-3.  SlotSSMs (https://github.com/JindongJiang/SlotSSMs)
-    Files:  Mamba / Mamba2 SSM blocks and supporting code.
+2.  SlotSSMs (https://github.com/JindongJiang/SlotSSMs)
+    Files:  Slot SSM blocks and supporting code (in model.py).
     License:  MIT — Copyright (c) 2024 Jindong Jiang
+
+
+External dependencies (not bundled)
+------------------------------------
+
+3.  V-JEPA 2 / V-JEPA 2.1 (https://github.com/facebookresearch/vjepa2)
+    No source code from this project is included in this repository.
+    vjepa_encoder.py is a thin wrapper that imports VisionTransformer model
+    definitions at runtime from a sibling clone of the vjepa2 repository.
+    The user must clone facebookresearch/vjepa2 separately (see README).
+    License:  MIT — Copyright (c) Meta Platforms, Inc. and affiliates.
 
 
 Original contributions
 ----------------------
 
-All original code written for vjepa_movad (configs, training scripts, new
+All original code written for vad-jepa (configs, training scripts, new
 model components that are not derivative of the MOVAD GPL code) is also
 offered under the MIT license:
 

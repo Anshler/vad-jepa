@@ -78,14 +78,26 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 
 > *Pre-proj* is the linear projection from the flattened 6×6 spatial grid (27K dim) → temporal input dim. SlotSSM variants avoid this by projecting per-block via cross-attention (768D → 512D).
 
-### Multi-head training
-
-```bash
-# Train SlotSSM + SG-SlotSSM side-by-side off one encoder
-python main.py --config cfgs/vjepa_slotssm.yaml cfgs/vjepa_sparse_slotssm.yaml --phase train
-```
-
 ---
+
+> **⚠️ Prerequisite: V-JEPA 2.1 source code required**
+>
+> This project does **not** package the V-JEPA 2.1 encoder — it imports the model
+> definitions directly from [facebookresearch/vjepa2](https://github.com/facebookresearch/vjepa2)
+> via `from app.vjepa_2_1.models.vision_transformer import ...`.
+>
+> Clone the V-JEPA 2.1 repo as a **sibling directory** so the import resolves:
+>
+> ```bash
+> git clone git@github.com:facebookresearch/vjepa2.git ../vjepa2
+> ```
+>
+> The expected layout is:
+> ```
+> your-workspace/
+> ├── vjepa2/          ← cloned from facebookresearch/vjepa2
+> └── vad-jepa/     ← this repo
+> ```
 
 ### Pretrained Weights
 
@@ -186,7 +198,7 @@ python main.py --config cfgs/vjepa_slotssm.yaml --phase train --epoch 50
 ## Project Structure
 
 ```
-vjepa_movad/
+vad-jepa/
 ├── main.py                        # Entry point — training & evaluation
 ├── model.py                       # ClsVJEPA + MultiHeadVJEPA + all temporal models
 ├── vjepa_encoder.py               # Frozen V-JEPA 2.1 ViT wrapper
@@ -229,14 +241,14 @@ vjepa_movad/
 
 ## License & Attribution
 
-This project combines original code with components from several open-source projects. The combined work is distributed under the **GNU General Public License v2**.
+This project contains original code and adapted components from open-source projects. The combined work is distributed under the **GNU General Public License v2** (see [`LICENSE`](LICENSE)).
 
-| Component | Source | License |
-|-----------|--------|---------|
-| MOVAD dataset loader, metrics | [MOVAD](https://github.com/hachreak/movad) | GPL v2 |
-| V-JEPA 2.1 encoder | [VJEPA2](https://github.com/facebookresearch/vjepa2) | MIT |
-| Slot SSM blocks | [SlotSSMs](https://github.com/JindongJiang/SlotSSMs) | MIT |
-| Original contributions | This work | MIT (when separate) |
+| Component | Source | License | Included? |
+|-----------|--------|---------|-----------|
+| MOVAD dataset loader, metrics | [MOVAD](https://github.com/hachreak/movad) | GPL v2 | Yes (adapted in `movad_core/`) |
+| Slot SSM blocks | [SlotSSMs](https://github.com/JindongJiang/SlotSSMs) | MIT | Yes (in `model.py`) |
+| Original contributions | This work | MIT | Yes |
+| V-JEPA 2.1 encoder | [VJEPA2](https://github.com/facebookresearch/vjepa2) | MIT | **No** — imported at runtime from a sibling clone (see [setup](#pretrained-weights) above) |
 
 See [`NOTICE`](NOTICE) for full attribution.
 

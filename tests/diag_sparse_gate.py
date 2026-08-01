@@ -14,7 +14,7 @@ Diagnostics (all computed from test-set inference, no retraining):
 
 Usage (WSL):
     conda activate vjepa2-312
-    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad
+    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vad-jepa
 
     python tests/diag_sparse_gate.py \
         --config cfgs/vjepa_sparse_slotssm.yaml \

@@ -4,7 +4,7 @@ All configs use torch.compile (the default in build_cls_vjepa).
 
 Usage (from WSL):
     conda activate vjepa2-312
-    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad
+    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vad-jepa
     python tests/bench_encoder_opts.py
 """
 from __future__ import annotations

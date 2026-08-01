@@ -3,7 +3,7 @@ Diagnose a downloaded MOVAD checkpoint — compare against the swin_lstm model. 
 
 Usage (WSL):
     conda activate vjepa2-312
-    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad
+    cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vad-jepa
     python tests/diagnose_checkpoint.py
 """
 from __future__ import annotations
