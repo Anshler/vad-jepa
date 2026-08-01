@@ -1,22 +1,6 @@
-<p align="center">
-  <img src="figures/architecture.png" alt="VAD-JEPA Architecture" width="100%">
-</p>
+# **VAD-JEPA: Slot-Memory-Augmented Online Video Anomaly Detection With JEPA**
 
-<h1 align="center">VAD-JEPA</h1>
-<h3 align="center">Slot-Memory-Augmented Online Video Anomaly Detection With JEPA</h3>
-
-<p align="center">
-  <a href="#"><img src="https://img.shields.io/badge/status-under%20review-yellow" alt="Status"></a>
-  <a href="#"><img src="https://img.shields.io/badge/DoTA%20AUC-84.3%25-blue" alt="DoTA AUC"></a>
-  <a href="#"><img src="https://img.shields.io/badge/framework-PyTorch-red" alt="Framework"></a>
-  <a href="#"><img src="https://img.shields.io/badge/license-GPL%20v2-green" alt="License"></a>
-</p>
-
----
-
-> **Self-supervised video representations (V-JEPA) paired with state-space temporal models (Mamba, SlotSSM, Sparse-Gated SlotSSM) for online traffic video anomaly detection on the DoTA benchmark.**
-
-This repository contains the official implementation of our paper, currently under review. It combines a **frozen or fine-tuned V-JEPA 2.1** video encoder (ViT-B, pretrained via masked feature prediction) with lightweight temporal models — LSTM, Mamba, SlotSSM, and our novel **Sparse-Gated SlotSSM (SG-SlotSSM)** — to detect anomalies in dashcam footage frame-by-frame under real-time constraints.
+This repository combines a **V-JEPA 2.1** video encoder with lightweight temporal models: LSTM, Mamba, SlotSSM, and our novel **Sparse-Gated SlotSSM (SG-SlotSSM)**, to detect anomalies in dashcam footage frame-by-frame under real-time constraints.
 
 ---
 
@@ -29,37 +13,6 @@ This repository contains the official implementation of our paper, currently und
 > We present the first systematic study of V-JEPA as a visual representation backbone for online traffic VAD. Following the standard two-stage online pipeline, we combine a V-JEPA encoder with a family of state-space temporal models spanning Mamba, SlotSSM, and a novel **Sparse-Gated SlotSSM (SG-SlotSSM)** that introduces selective slot freezing to enable persistent long-term memory. All models are evaluated under comparable parameter budgets and identical online settings on the DoTA benchmark, allowing us to isolate the contributions of both visual representation learning and temporal memory.
 >
 > Our experiments show that replacing the supervised visual backbone with V-JEPA consistently improves detection performance across two-stage architectures, achieving higher frame-level AUC while preserving real-time operation. Furthermore, although SG-SlotSSM does not outperform dense slot memory under standard training regimes, it overtakes SlotSSM once trained on sufficiently long temporal sequences, indicating that sparse persistent memory may become increasingly effective as temporal context and training budgets scale. Although reconstruction-based self-supervised representations that retain finer visual detail remain stronger overall, our findings establish predictive JEPA representations as a competitive foundation for online traffic video anomaly detection and identify sparse persistent memory as a promising direction for future long-horizon temporal modeling.
-
----
-
-## Key Results
-
-| Model | Encoder | VCL | AUC-ROC | Δ vs. Encoder-Only |
-|-------|---------|:---:|:-------:|:-------------------:|
-| **SG-SlotSSM** (unofficial best) | Fine-tuned | 64 | **85.6%** | +4.1 |
-| **SlotSSM** (official best) | Fine-tuned | 28 | **84.3%** | +2.8 |
-| **SG-SlotSSM** | Fine-tuned | 28 | 82.7% | +1.2 |
-| **Mamba** | Fine-tuned | 28 | 82.4% | +0.9 |
-| **Encoder-only** | Fine-tuned | — | 81.9% | — |
-| **MOVAD** (Swin-B + LSTM) | Supervised | — | 82.2% | — |
-| **DAPT-VideoMAE-L** | Reconstruction | — | 88.4% | — |
-
-<p align="center">
-  <img src="figures/longterm.png" alt="Training curves" width="85%">
-  <br>
-  <em>Temporal model training curves on the DoTA benchmark. SlotSSM achieves the best official performance at 84.3% AUC.</em>
-</p>
-
----
-
-## What's New
-
-- **First systematic study** of V-JEPA representations for online traffic video anomaly detection
-- **SG-SlotSSM** — a novel sparse-gated slot-based state-space memory that freezes inactive slots for persistent long-term memory, with ε-greedy routing and entropy regularization
-- **V-JEPA +7.4 AUC** over supervised Swin-B at the encoder-only level (81.9% vs. 74.5%)
-- **Multi-head training** — one frozen encoder, multiple independent temporal heads trained simultaneously
-- **SlotSSM variants are 3× smaller** than LSTM/Mamba — they avoid the 28M pre-projection bottleneck by projecting grid tokens directly to slot dimension
-- **18.5M** (SlotSSM/SG-SlotSSM) vs. **49–55M** (Mamba/LSTM) trainable non-encoder params
 
 ---
 
@@ -81,6 +34,41 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 
 ---
 
+## Key Results
+
+| Model | VCL | AUC-ROC |
+|-------|:---:|:-------:|
+|(Ours)|||
+| **SG-SlotSSM** (unofficial best) | 64 | **85.6%** |
+| **SlotSSM** (official best) | 28 | **84.3%** |
+| **SG-SlotSSM** | 28 | 82.7% |
+| **Mamba** | 28 | 82.4% |
+| **Encoder-only** | — | 81.9% |
+| (Related works) |||
+| [**MOVAD**](https://github.com/IMPLabUniPr/movad) | 8 | 82.2% |
+| [**DAPT-VideoMAE-S**](https://github.com/tue-mps/simple-tad) | — | 86.4% |
+| **DAPT-VideoMAE-B** | — | 87.9% |
+| **DAPT-VideoMAE-L** | — | 88.4% |
+
+<p align="center">
+  <img src="figures/longterm.png" alt="Training curves" width="85%">
+  <br>
+  <em>Temporal model training curves on the DoTA benchmark. SlotSSM achieves the best official performance at 84.3% AUC.</em>
+</p>
+
+---
+
+## What's New
+
+- **First systematic study** of V-JEPA representations for online traffic video anomaly detection
+- **SG-SlotSSM** — a novel sparse-gated slot-based state-space memory that freezes inactive slots for persistent long-term memory, with ε-greedy routing and entropy regularization
+- **V-JEPA +7.4 AUC** over supervised Swin-B at the encoder-only level (81.9% vs. 74.5%)
+- **Multi-head training** — one frozen encoder, multiple independent temporal heads trained simultaneously
+- **SlotSSM variants are 3× smaller** than LSTM/Mamba — they avoid the 28M pre-projection bottleneck by projecting grid tokens directly to slot dimension
+- **18.5M** (SlotSSM/SG-SlotSSM) vs. **49–55M** (Mamba/LSTM) trainable non-encoder params
+
+---
+
 ## Temporal Model Variants
 
 | Config | Temporal Model | Type | Pre-proj | Temporal | Post-cls | **Trainable (Non-encoder)** |
@@ -89,7 +77,7 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 | `vjepa_mamba.yaml` | Mamba-2 × 3 | SSM | 28.37M | 19.81M | 1.05M | **49.2M** |
 | `vjepa_slotssm.yaml` | SlotSSM | Slot SSM | — | 16.89M | 1.58M | **18.5M** |
 | `vjepa_sparse_slotssm.yaml` | SG-SlotSSM | Slot SSM | — | 16.90M | 1.58M | **18.5M** |
-| `vjepa_linear_probe.yaml` | Per-frame MLP | Diagnostic | 28.37M | — | 1.05M | **29.4M** |
+| `vjepa_linear_probe.yaml` | Per-frame MLP | Encoder Only | 28.37M | — | 1.05M | **29.4M** |
 
 > *Pre-proj* is the linear projection from the flattened 6×6 spatial grid (27K dim) → temporal input dim. SlotSSM variants avoid this by projecting per-block via cross-attention (768D → 512D).
 
@@ -155,8 +143,8 @@ data/dota
 ### Train
 
 ```bash
-# Single model
-python main.py --config cfgs/vjepa_slotssm.yaml --phase train --epochs 200
+# Single model (finetuned encoder)
+python main.py --config cfgs/vjepa_slotssm.yaml --phase train --epochs 200 --train_encoder
 
 # Multi-head (SlotSSM + SG-SlotSSM side-by-side, only for frozen encoder)
 python main.py --config cfgs/vjepa_slotssm.yaml cfgs/vjepa_sparse_slotssm.yaml --phase train --epochs 200
@@ -226,9 +214,9 @@ vjepa_movad/
 │   ├── test_inference.py          # Smoke tests for all temporal models
 │   ├── test_training.py           # Training overfit tests
 │   ├── test_overfit.py            # Extended overfit tests
-│   ├── bench_encoder_opts.py      # Encoder throughput benchmarks
-│   ├── benchmark_latency.py       # Temporal model latency benchmarks
-│   ├── diagnose_checkpoint.py     # Checkpoint key diagnostics
+│   ├── bench_encoder_opts.py      # Model throughput benchmark for different optimization strategy
+│   ├── benchmark_latency.py       # Model throughput benchmark for different temporal config
+│   ├── diagnose_checkpoint.py     # Checkpoint key diagnostics, load MOVAD checkpoint and convert format
 │   ├── diag_slots.py              # Slot usage analysis (SlotSSM)
 │   ├── diag_sparse_gate.py        # Sparse gate diagnostics
 │   ├── quick_val.py               # Fast validation on subset
