@@ -1,0 +1,77 @@
+# =============================================================================
+# VAD-JEPA — requirements.txt
+# =============================================================================
+#
+#   python -m pip install -r requirements.txt
+#
+# =============================================================================
+# Python + CUDA compatibility
+# =============================================================================
+# This project was developed and tested with the following environment.
+# The optional CUDA-kernel packages (mamba-ssm)
+# MUST be compiled against your EXACT Python + PyTorch + CUDA versions —
+# mixing versions = segfaults.
+#
+#   Python        3.12
+#   CUDA toolkit  13.0  (or 12.x — torch 2.11 also ships cu124 wheels)
+#   PyTorch       2.11.0+cu130        # pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+#   mamba-ssm     2.3.2.post1         # custom wheel, built for cp312 + cu13 + torch2.11
+#
+# To match this exact stack on a fresh machine:
+#
+#   1. Install CUDA 13.0 toolkit (or at least the driver, ~R560+)
+#   2. conda create -n vjepa2-312 python=3.12
+#   3. pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu130
+#   4. pip install -r requirements.txt
+#   5. Build mamba-ssm from source or find a pre-built wheel for your versions:
+#        pip install mamba-ssm
+#      See: https://github.com/state-spaces/mamba
+#   6. Build flash-attn from source or grab a pre-built wheel:
+#        pip install flash-attn --no-build-isolation
+#      Pre-built wheels: https://github.com/Dao-AILab/flash-attention/releases
+#
+# Core dependencies are required for all temporal model variants.
+# Optional sections can be installed selectively.
+
+# =============================================================================
+# Core — required for all variants (LSTM, Mamba, SlotSSM, etc.)
+# =============================================================================
+torch>=2.11.0
+torchvision>=0.26.0
+pytorchvideo>=0.1.5
+easydict>=1.13
+numpy>=2.5.1
+pyyaml>=6.0.3
+scikit-learn>=1.8.0
+scipy>=1.17.1
+tqdm>=4.68.4
+tensorboard>=2.20.0
+pillow>=12.2.0
+opencv-python>=4.13.0
+matplotlib>=3.10.9
+pandas>=3.0.3
+einops>=0.8.2
+timm>=1.0.27
+fvcore>=0.1.5
+iopath>=0.1.10
+submitit>=1.5.4
+wandb>=0.26.1
+fire>=0.7.1
+decord>=0.6.0
+webdataset>=1.0.2
+huggingface_hub>=1.23.0
+
+# =============================================================================
+# Mamba SSM — required for Mamba / SlotSSM / Sparse SlotSSM variants
+# Install separately: these are CUDA kernel packages that must be built
+# against your exact PyTorch + CUDA version.
+# See: https://github.com/state-spaces/mamba
+# =============================================================================
+# mamba-ssm
+
+# =============================================================================
+# Flash Attention — optional, speeds up SlotSSM cross/self attention
+# Must be built against your exact PyTorch + CUDA version.
+# Pre-built wheels: https://github.com/Dao-AILab/flash-attention/releases
+# =============================================================================
+# flash-attn

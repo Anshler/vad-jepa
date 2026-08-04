@@ -1,5 +1,11 @@
 # **VAD-JEPA: Slot-Memory-Augmented Online Video Anomaly Detection With JEPA**
 
+<p align="center">
+  <a href="https://colab.research.google.com/drive/1kdLUm_Xd63EuodapMljrhVHXMbX68ARf?usp=sharing">
+    <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab" height="40">
+  </a>
+</p>
+
 This repository combines a **V-JEPA 2.1** video encoder with lightweight temporal models: LSTM, Mamba, SlotSSM, and our novel **Sparse-Gated SlotSSM (SG-SlotSSM)**, to detect anomalies in dashcam footage frame-by-frame under real-time constraints.
 
 ---
