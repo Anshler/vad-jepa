@@ -261,5 +261,5 @@ See [`NOTICE`](NOTICE) for full attribution.
 ---
 
 <p align="center">
-  <sub>Built with <a href="https://github.com/facebookresearch/vjepa2">V-JEPA 2.1</a>, <a href="https://github.com/state-spaces/mamba">Mamba</a>, and <a href="https://github.com/JindongJiang/SlotSSMs">SlotSSMs</a>.</sub>
+  <sub>Built with <a href="https://github.com/facebookresearch/vjepa2">V-JEPA 2.1</a>, <a href="https://github.com/state-spaces/mamba">Mamba</a>, <a href="https://github.com/hachreak/movad">MOVAD</a>, and <a href="https://github.com/JindongJiang/SlotSSMs">SlotSSMs</a>.</sub>
 </p>
