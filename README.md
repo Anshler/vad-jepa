@@ -2,7 +2,10 @@
 
 <p align="center">
   <a href="https://colab.research.google.com/drive/1kdLUm_Xd63EuodapMljrhVHXMbX68ARf?usp=sharing">
-    <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab" height="40">
+    <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab" height="20">
+  </a>
+  <a href="https://huggingface.co/Anshler/vad-jepa">
+    <img src="https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-md.svg" alt="Hugging Face Model" height="20">
   </a>
 </p>
 
@@ -120,6 +123,29 @@ Update `checkpoint_path` in your config:
 ```yaml
 checkpoint_path: /path/to/vjepa2_1_vitb_dist_vitG_384.pt
 ```
+
+### 🤗 Pretrained Temporal Model Weights
+
+Pre-trained temporal model checkpoints (LSTM, Mamba, SlotSSM, SG-SlotSSM) are available on Hugging Face:
+
+<p align="center">
+  <a href="https://huggingface.co/Anshler/vad-jepa">
+    <img src="https://img.shields.io/badge/🤗_Hugging_Face-Anshler/vad--jepa-FFD21E?style=for-the-badge" alt="Hugging Face Models">
+  </a>
+</p>
+
+Download a checkpoint and point your config's `checkpoint_path` to the encoder weights (from V-JEPA 2.1), then specify the temporal head checkpoint at test time via `--epoch`:
+
+```bash
+python main.py --config cfgs/vjepa_slotssm.yaml --phase test --epoch 190
+```
+
+| Variant | Config | Download |
+|---------|--------|----------|
+| SG-SlotSSM (VCL=64, best) | `cfgs/vjepa_sparse_slotssm.yaml` | [`sg_slotssm_vcl64_best.pt`](https://huggingface.co/Anshler/vad-jepa) |
+| SlotSSM (VCL=28, best) | `cfgs/vjepa_slotssm.yaml` | [`slotssm_vcl28_best.pt`](https://huggingface.co/Anshler/vad-jepa) |
+| Mamba (VCL=28) | `cfgs/vjepa_mamba.yaml` | [`mamba_vcl28.pt`](https://huggingface.co/Anshler/vad-jepa) |
+| LSTM (VCL=8) | `cfgs/vjepa_v1.yaml` | [`lstm_vcl8.pt`](https://huggingface.co/Anshler/vad-jepa) |
 
 ### Dataset: DoTA
 
