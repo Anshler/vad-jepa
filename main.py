@@ -292,21 +292,49 @@ def train(cfg, model, traindata_loader, begin_epoch,
     # the full model (encoder → projection → temporal → classifier).
     # -------------------------------------------------------------------
     def _run_temporal_loop(head, video_data, data_info, fb, v_len, head_name, opt):
-        """MOVAD-style per-frame training: encode + temporal + backward at every frame.
+        """MOVAD-style temporal training loop.
 
         Each clip ``[B, C, NF, H, W]`` passes through the full model:
         ``head(clip, state)`` handles Swin→pool→proj→LSTM→classifier
-        (or equivalent ViT path) in one call.  This matches the original
-        MOVAD pattern exactly — no pre-computed features, no stale gradients.
+        (or equivalent ViT path) in one call.
+
+        Backprop cadence is controlled by the ``bptt_horizon`` head config:
+          * ``1`` (default)          — per-frame truncated BPTT, hidden state
+                                       detached every clip-step (original MOVAD
+                                       behavior; starves a recurrent model of
+                                       temporal gradient).
+          * ``window`` / ``VCL - NF``— full-window BPTT: unroll the whole
+                                       window and backprop through all clip-
+                                       positions at once, detaching the hidden
+                                       state only at the window boundary.  This
+                                       is what lets an LSTM actually learn.
+          * integer N                — chunked BPTT: backward every N clip-steps.
         """
         toa_batch = data_info[:, 2]
         tea_batch = data_info[:, 3]
         video_len_orig = data_info[:, 0]
 
+        hc = head_cfgs[head_name]
+        bptt = hc.get("bptt_horizon", 1)
+        grad_clip = hc.get("grad_clip", None)
+        n_clip_steps = v_len - fb
+        if bptt in (None, "window", float("inf"), "full"):
+            bptt = n_clip_steps
+        bptt = max(int(bptt), 1)
+
+        # Recurrent models keep (h, c) on the autograd graph between clip-steps
+        # so backward can unroll through time; detachment happens at chunk
+        # boundaries below instead of inside the model every frame.
+        if bptt > 1 and getattr(head.temporal, "detach_every_step", None) is not None:
+            head.temporal.detach_every_step = False
+
         state = None
         slot_diag = {}
         total_loss_val = 0.0
         frame_count = 0
+
+        acc_loss = None
+        steps_since_bwd = 0
 
         for i in range(fb, v_len):
             target = gt_cls_target(i, toa_batch, tea_batch).long()
@@ -338,13 +366,27 @@ def train(cfg, model, traindata_loader, begin_epoch,
                     slot_diag["usage_frac"] = min(slot_diag.get("usage_frac", 999.0), float(head.temporal._slot_usage_frac))
                     slot_diag["_count"] = slot_diag.get("_count", 0) + 1
 
-            # MOVAD-style: per-frame backward + step
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-
+            # Accumulate the loss across clip-steps; backprop through time
+            # (chunked BPTT) only at boundaries.
+            acc_loss = loss if acc_loss is None else acc_loss + loss
             total_loss_val += loss.detach().item()
             frame_count += 1
+            steps_since_bwd += 1
+
+            boundary = (steps_since_bwd >= bptt) or (i == v_len - 1)
+            if boundary:
+                opt.zero_grad()
+                acc_loss.backward()
+                if grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in head.parameters() if p.requires_grad], grad_clip)
+                opt.step()
+                # Detach the recurrent state at the chunk boundary (LSTM: (h, c)).
+                # SSMs like Mamba/Slot carry their own cache and need no detach.
+                if isinstance(state, tuple):
+                    state = (state[0].detach(), state[1].detach())
+                acc_loss = None
+                steps_since_bwd = 0
 
         return total_loss_val, frame_count, slot_diag
 

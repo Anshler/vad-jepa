@@ -190,7 +190,7 @@ def _weights_init(m):
         torch.nn.init.xavier_uniform_(m.weight, gain=1)
         if m.bias is not None:
             torch.nn.init.constant_(m.bias, 0)
-    if isinstance(m, nn.LSTM):
+    if isinstance(m, nn.LSTMCell):
         for param in m.parameters():
             if len(param.shape) >= 2:
                 torch.nn.init.orthogonal_(param.data)
@@ -238,6 +238,11 @@ class LSTMTemporalModel(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.hidden_size = hidden_size
         self.bidirectional = bidirectional
+        # When True (default), (h, c) are detached EVERY clip-step — this is
+        # truncated BPTT with horizon 1, which starves the LSTM of temporal
+        # gradient.  The training loop sets this to False and detaches at
+        # chunk boundaries instead, enabling real backprop-through-time.
+        self.detach_every_step = True
 
     @property
     def output_dim(self) -> int:
@@ -248,7 +253,9 @@ class LSTMTemporalModel(nn.Module):
         x, new_state = self.rnn(x, state)
         x = x.squeeze(0)
         hx, cx = new_state
-        return x, (hx.detach(), cx.detach())
+        if self.detach_every_step:
+            hx, cx = hx.detach(), cx.detach()
+        return x, (hx, cx)
 
 
 # ===========================================================================
