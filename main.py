@@ -76,6 +76,7 @@ def parse_configs():
     _DEFAULT_CONFIGS = [
         "cfgs/vjepa_slotssm.yaml",
         "cfgs/vjepa_sparse_slotssm.yaml",
+        "cfgs/vjepa_mamba.yaml",
     ]
     parser.add_argument("--config", nargs="+", default=_DEFAULT_CONFIGS,
                         help="YAML config(s). First = master (encoder/data/training/...); "
