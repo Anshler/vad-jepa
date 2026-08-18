@@ -142,10 +142,10 @@ python main.py --config cfgs/vjepa_slotssm.yaml --phase test --epoch 190
 
 | Variant | Config | Download |
 |---------|--------|----------|
-| SG-SlotSSM (VCL=64, best) | `cfgs/vjepa_sparse_slotssm.yaml` | [`sg_slotssm_vcl64_best.pt`](https://huggingface.co/Anshler/vad-jepa) |
-| SlotSSM (VCL=28, best) | `cfgs/vjepa_slotssm.yaml` | [`slotssm_vcl28_best.pt`](https://huggingface.co/Anshler/vad-jepa) |
-| Mamba (VCL=28) | `cfgs/vjepa_mamba.yaml` | [`mamba_vcl28.pt`](https://huggingface.co/Anshler/vad-jepa) |
-| LSTM (VCL=8) | `cfgs/vjepa_v1.yaml` | [`lstm_vcl8.pt`](https://huggingface.co/Anshler/vad-jepa) |
+| SG-SlotSSM (VCL=64, best) | `cfgs/vjepa_sparse_slotssm.yaml` | [`model.pt`](https://huggingface.co/Anshler/vad-jepa/tree/main/vjepa_sparse_slotssm_VCL_64_NF_4_finetuned/checkpoints) |
+| SlotSSM (VCL=64) | `cfgs/vjepa_slotssm.yaml` | [`model.pt`](https://huggingface.co/Anshler/vad-jepa/tree/main/vjepa_slotssm_VCL_64_NF_4_finetuned/checkpoints) |
+| Mamba (VCL=64) | `cfgs/vjepa_mamba.yaml` | [`model.pt`](https://huggingface.co/Anshler/vad-jepa/tree/main/vjepa_mamba_VCL_64_NF_4_finetuned/checkpoints) |
+| LSTM (VCL=64) | `cfgs/vjepa_v1.yaml` | [`model.pt`](https://huggingface.co/Anshler/vad-jepa/tree/main/vjepa_v1_VCL_64_NF_4_finetuned/checkpoints) |
 
 ### Dataset: DoTA
 
