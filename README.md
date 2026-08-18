@@ -45,19 +45,19 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 
 ## Key Results
 
-| Model | VCL | AUC-ROC |
-|-------|:---:|:-------:|
-|(Ours)|||
-| **SG-SlotSSM** (unofficial best) | 64 | **85.6%** |
-| **SlotSSM** (official best) | 28 | **84.3%** |
-| **SG-SlotSSM** | 28 | 82.7% |
-| **Mamba** | 28 | 82.4% |
-| **Encoder-only** | — | 81.9% |
-| (Related works) |||
-| [**MOVAD**](https://github.com/IMPLabUniPr/movad) | 8 | 82.2% |
-| [**DAPT-VideoMAE-S**](https://github.com/tue-mps/simple-tad) | — | 86.4% |
-| **DAPT-VideoMAE-B** | — | 87.9% |
-| **DAPT-VideoMAE-L** | — | 88.4% |
+| Model | NF | VCL | AUC-ROC |
+|-------|:---:|:---:|:-------:|
+|(Ours)||||
+| **SG-SlotSSM** | 4 | 64 | **85.3%** |
+| **LSTM** | 4 |  64 | 85.1% |
+| **SlotSSM** | 4 |  64 | 85.1% |
+| **Mamba** | 4 |  64 | 83.8% |
+| **Encoder-only** | 8 |  — | 81.9% |
+| (Related works) ||||
+| [**MOVAD**](https://github.com/IMPLabUniPr/movad) | 4 | 8 | 82.2% |
+| [**DAPT-VideoMAE-S**](https://github.com/tue-mps/simple-tad) | 16 |  — | 86.4% |
+| **DAPT-VideoMAE-B** | 16 | — | 87.9% |
+| **DAPT-VideoMAE-L** | 16 | — | 88.4% |
 
 <p align="center">
   <img src="figures/longterm.png" alt="Training curves" width="85%">
