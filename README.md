@@ -64,7 +64,7 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 <p align="center">
   <img src="figures/longterm.png" alt="Training curves" width="85%">
   <br>
-  <em>Temporal model training curves on the DoTA benchmark. SlotSSM achieves the best official performance at 84.3% AUC.</em>
+  <em>Temporal model training curves on the DoTA benchmark. SG-SlotSSM achieves the best performance at 85.3% AUC.</em>
 </p>
 
 ---
@@ -81,11 +81,11 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 
 | Config | Temporal Model | Type | Pre-proj | Temporal | Post-cls | **Trainable (Non-encoder)** |
 |--------|---------------|:----:|:--------:|:--------:|:--------:|:-------------:|
+| `vjepa_linear_probe.yaml` | Per-frame MLP | Encoder Only | 28.37M | — | 1.05M | **29.4M** |
 | `vjepa_v1.yaml` | 3-layer LSTM | Recurrent | 28.37M | 25.19M | 1.05M | **54.6M** |
 | `vjepa_mamba.yaml` | Mamba-2 × 3 | SSM | 28.37M | 19.81M | 1.05M | **49.2M** |
 | `vjepa_slotssm.yaml` | SlotSSM | Slot SSM | — | 16.89M | 1.58M | **18.5M** |
 | `vjepa_sparse_slotssm.yaml` | SG-SlotSSM | Slot SSM | — | 16.90M | 1.58M | **18.5M** |
-| `vjepa_linear_probe.yaml` | Per-frame MLP | Encoder Only | 28.37M | — | 1.05M | **29.4M** |
 
 > *Pre-proj* is the linear projection from the flattened 6×6 spatial grid (27K dim) → temporal input dim. SlotSSM variants avoid this by projecting per-block via cross-attention (768D → 512D).
 
@@ -144,10 +144,11 @@ python main.py --config cfgs/vjepa_slotssm.yaml --phase test --epoch 190
 
 | Variant | Config | Download |
 |---------|--------|----------|
-| SG-SlotSSM (VCL=64, best) | `cfgs/vjepa_sparse_slotssm.yaml` | [`model.pt`](https://huggingface.co/Anshler/vad-jepa/tree/main/vjepa_sparse_slotssm_VCL_64_NF_4_finetuned/checkpoints) |
-| SlotSSM (VCL=64) | `cfgs/vjepa_slotssm.yaml` | [`model.pt`](https://huggingface.co/Anshler/vad-jepa/tree/main/vjepa_slotssm_VCL_64_NF_4_finetuned/checkpoints) |
-| Mamba (VCL=64) | `cfgs/vjepa_mamba.yaml` | [`model.pt`](https://huggingface.co/Anshler/vad-jepa/tree/main/vjepa_mamba_VCL_64_NF_4_finetuned/checkpoints) |
-| LSTM (VCL=64) | `cfgs/vjepa_v1.yaml` | [`model.pt`](https://huggingface.co/Anshler/vad-jepa/tree/main/vjepa_v1_VCL_64_NF_4_finetuned/checkpoints) |
+| SG-SlotSSM | `cfgs/vjepa_sparse_slotssm.yaml` | [`model.pt`](https://huggingface.co/Anshler/vad-jepa/tree/main/vjepa_sparse_slotssm_VCL_64_NF_4_finetuned/checkpoints) |
+| SlotSSM | `cfgs/vjepa_slotssm.yaml` | [`model.pt`](https://huggingface.co/Anshler/vad-jepa/tree/main/vjepa_slotssm_VCL_64_NF_4_finetuned/checkpoints) |
+| Mamba | `cfgs/vjepa_mamba.yaml` | [`model.pt`](https://huggingface.co/Anshler/vad-jepa/tree/main/vjepa_mamba_VCL_64_NF_4_finetuned/checkpoints) |
+| LSTM | `cfgs/vjepa_v1.yaml` | [`model.pt`](https://huggingface.co/Anshler/vad-jepa/tree/main/vjepa_v1_VCL_64_NF_4_finetuned/checkpoints) |
+| Encoder Only | `cfgs/vjepa_linear_probe.yaml` | [`model.pt`](https://huggingface.co/Anshler/vad-jepa/tree/main/vjepa_linear_probe_VCL_8_NF_4_finetuned/checkpoints) |
 
 ### Dataset: DoTA
 
