@@ -52,7 +52,9 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 | **LSTM** | 4 |  64 | 85.1% |
 | **SlotSSM** | 4 |  64 | 85.1% |
 | **Mamba** | 4 |  64 | 83.8% |
+| **LSTM** | 4 |  8 | 83.3% |
 | **Encoder-only** | 8 |  — | 81.9% |
+| **Encoder-only** | 4 |  — | 81.5% |
 | (Related works) ||||
 | [**MOVAD**](https://github.com/IMPLabUniPr/movad) | 4 | 8 | 82.2% |
 | [**DAPT-VideoMAE-S**](https://github.com/tue-mps/simple-tad) | 16 |  — | 86.4% |
