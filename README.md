@@ -81,9 +81,9 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 
 | Config | Temporal Model | Type | Pre-proj | Temporal | Post-cls | **Trainable (Non-encoder)** |
 |--------|---------------|:----:|:--------:|:--------:|:--------:|:-------------:|
-| `vjepa_linear_probe.yaml` | Per-frame MLP | Encoder Only | 28.37M | — | 1.05M | **29.4M** |
-| `vjepa_v1.yaml` | 3-layer LSTM | Recurrent | 28.37M | 25.19M | 1.05M | **54.6M** |
-| `vjepa_mamba.yaml` | Mamba-2 × 3 | SSM | 28.37M | 19.81M | 1.05M | **49.2M** |
+| `vjepa_linear_probe.yaml` | Per-frame MLP | Encoder Only | 28.3M | — | 1.05M | **29.4M** |
+| `vjepa_v1.yaml` | 3-layer LSTM | Recurrent | 28.3M | 25.19M | 1.05M | **54.6M** |
+| `vjepa_mamba.yaml` | Mamba-2 × 3 | SSM | 28.3M | 19.81M | 1.05M | **49.2M** |
 | `vjepa_slotssm.yaml` | SlotSSM | Slot SSM | — | 16.89M | 1.58M | **18.5M** |
 | `vjepa_sparse_slotssm.yaml` | SG-SlotSSM | Slot SSM | — | 16.90M | 1.58M | **18.5M** |
 
