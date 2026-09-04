@@ -13,6 +13,7 @@ from pytorchvideo import transforms as T
 
 from torch.utils.data import DataLoader
 from movad_core.data_transform import pad_collate_videos, pad_frames, RandomVerticalFlip, RandomHorizontalFlip
+from movad_core.simpletad_aug import SimpleTadAugmentTrain, SimpleTadAugmentVal
 
 
 anomalies = [
@@ -242,35 +243,62 @@ def setup_dota(Dota, cfg, num_workers=-1,
     vertical_flip_prob = cfg.get('vertical_flip_prob', 0.)
     horizontal_flip_prob = cfg.get('horizontal_flip_prob', 0.)
 
-    #  def transf_train(x):
-    transform_dict = {
-        'image': transforms.Compose([
-            pad_frames(cfg.input_shape),
-            transforms.Lambda(lambda x: torch.tensor(x)),
-            # [T, H, W, C] -> [T, C, H, W]
-            transforms.Lambda(lambda x: x.permute(0, 3, 1, 2)),
-            transforms.Lambda(lambda x: x / 255.0),
-            transforms.Normalize(params['mean'], params['std']),
-            # [T, C, H, W]
-        ]),
-    }
+    # --- Augmentation mode: 'movad' (default, unchanged) or 'simpletad' ------
+    # simpletad mode mirrors simple-tad's DoTA recipe (RandAugment + RandomErasing
+    # + ImageNet normalization at 224) and is what the DAPT-VideoMAE-S configs use.
+    augmentation_mode = cfg.get('augmentation_mode', 'movad')
+    _st_crop = int(cfg.get('input_shape', [224, 224])[0])
+    _st_mean = cfg.get('data_mean', [0.485, 0.456, 0.406])
+    _st_std = cfg.get('data_std', [0.229, 0.224, 0.225])
 
-    transform_dict_train = {
-        'image': transforms.Compose([
-            pad_frames(cfg.input_shape),
-            transforms.Lambda(lambda x: torch.tensor(x)),
-            # [T, H, W, C] -> [T, C, H, W]
-            transforms.Lambda(lambda x: x.permute(0, 3, 1, 2)),
-            T.AugMix(),
-            transforms.Lambda(lambda x: x / 255.0),
-            transforms.Normalize(params['mean'], params['std']),
-            # [T, C, H, W]
-        ]),
-    }
+    if augmentation_mode == 'simpletad':
+        # train uses RandAugment + random erasing; val/test use a plain
+        # square crop (no augmentation).  Both output [T, C, H, W] normalized.
+        # !!! The flippers are applied separately in Dota.__getitem__ AFTER this
+        # transform, so they still work as configured.
+        train_image = transforms.Compose([
+            transforms.Lambda(lambda x: SimpleTadAugmentTrain(
+                crop_size=_st_crop, mean=_st_mean, std=_st_std)(
+                    torch.as_tensor(x)))
+        ])
+        val_image = transforms.Compose([
+            transforms.Lambda(lambda x: SimpleTadAugmentVal(
+                crop_size=_st_crop, mean=_st_mean, std=_st_std)(
+                    torch.as_tensor(x)))
+        ])
+        transform_dict_train = {'image': train_image}
+        transform_dict = {'image': val_image}
+        transform_dict_to_play = {'image': None}
+    else:
+        # ---- original MOVAD (AugMix) pipeline, unchanged ----
+        transform_dict = {
+            'image': transforms.Compose([
+                pad_frames(cfg.input_shape),
+                transforms.Lambda(lambda x: torch.tensor(x)),
+                # [T, H, W, C] -> [T, C, H, W]
+                transforms.Lambda(lambda x: x.permute(0, 3, 1, 2)),
+                transforms.Lambda(lambda x: x / 255.0),
+                transforms.Normalize(params['mean'], params['std']),
+                # [T, C, H, W]
+            ]),
+        }
 
-    transform_dict_to_play = {
-        'image': None,
-    }
+        transform_dict_train = {
+            'image': transforms.Compose([
+                pad_frames(cfg.input_shape),
+                transforms.Lambda(lambda x: torch.tensor(x)),
+                # [T, H, W, C] -> [T, C, H, W]
+                transforms.Lambda(lambda x: x.permute(0, 3, 1, 2)),
+                T.AugMix(),
+                transforms.Lambda(lambda x: x / 255.0),
+                transforms.Normalize(params['mean'], params['std']),
+                # [T, C, H, W]
+            ]),
+        }
+
+        transform_dict_to_play = {
+            'image': None,
+        }
 
     traindata_loader, testdata_loader = None, None
 

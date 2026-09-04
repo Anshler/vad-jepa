@@ -31,12 +31,14 @@ from movad_core.losses import build_loss
 from movad_core.optim import build_optimizer
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--config", default="cfgs/swin_mamba.yaml",
-                    help="Path to config YAML (e.g. cfgs/swin_lstm.yaml or cfgs/vjepa_v1.yaml)")
+parser.add_argument("--config", default="cfgs/videomae_s_mamba.yaml",
+                    help="Path to config YAML (e.g. cfgs/videomae_s_mamba.yaml or cfgs/vjepa_mamba.yaml)")
 parser.add_argument("--checkpoint", default=None,
                     help="Override checkpoint path (uses config value if not set)")
 parser.add_argument("--epochs", type=int, default=100)
-parser.add_argument("--lr", type=float, default=0.01)
+# Default: use the config's LR (all head cfgs train at 5e-5; the test must not
+# invent its own — an LR 100× too high diverges the Mamba head into NaN).
+parser.add_argument("--lr", type=float, default=None, help="Override config LR (default: use config's `lr` value)")
 parser.add_argument("--train_encoder", action="store_true", default=False)
 parser.add_argument("--softmax", action="store_true", default=False,
                     help="Enable double-softmax (for comparing with old behavior)")
@@ -46,7 +48,7 @@ args = parser.parse_args()
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 apply_softmax = args.softmax
-print(f"Device: {DEVICE}  |  train_encoder={args.train_encoder}  |  lr={args.lr}"
+print(f"Device: {DEVICE}  |  train_encoder={args.train_encoder}  |  lr={args.lr or 'cfg'}"
       f"  |  epochs={args.epochs}  |  softmax={apply_softmax}  |  real_data={args.real_data}")
 
 torch.manual_seed(42)
@@ -58,7 +60,10 @@ cfg = EasyDict(yaml.safe_load(open(cfg_path)))
 cfg.device = DEVICE
 cfg.checkpoint_path = args.checkpoint or cfg.get("checkpoint_path")
 cfg.compile = False
-cfg.lr = args.lr
+# Effective LR: CLI override, else the config's value (all head cfgs train at 5e-5).
+lr = args.lr if args.lr is not None else cfg.get("lr", 5e-5)
+print(f"  effective lr={lr}")
+cfg.lr = lr
 cfg.train_encoder = args.train_encoder
 cfg._head_cfgs_flat = [dict(cfg)]
 cfg._head_cfgs_flat[0]["name"] = "test_head"
@@ -80,7 +85,7 @@ head_cfg = EasyDict(dict(cfg))
 head_cfg.device = DEVICE
 head_cfg.name = head_name
 criterion = build_loss(head_cfg)
-opt, _ = build_optimizer(EasyDict({"lr": args.lr}), head, None)
+opt, _ = build_optimizer(EasyDict({"lr": lr}), head, None)
 
 model.to(DEVICE)
 model.train()
@@ -114,12 +119,16 @@ if args.real_data:
                            for f in frame_files]).astype(np.float32)
     # frames_np: [T, H, W, C]
 
-    # Preprocess: resize + normalize to [-1, 1]  (matching Dota transforms)
+    # Preprocess: resize + normalize using the config's data_mean/data_std
+    # (matching the encoder's assumed input stats — MOVAD uses [-1,1] i.e.
+    #  mean/std 0.5; VideoMAE uses ImageNet stats).
     input_shape = cfg.get("input_shape", [240, 320])
+    _mean = torch.tensor(cfg.get("data_mean", [0.5, 0.5, 0.5]), dtype=torch.float32)
+    _std = torch.tensor(cfg.get("data_std", [0.5, 0.5, 0.5]), dtype=torch.float32)
     H_in, W_in = input_shape
-    frames_t = torch.from_numpy(frames_np).permute(0, 3, 1, 2)          # [T, C, OH, OW]
+    frames_t = torch.from_numpy(frames_np).permute(0, 3, 1, 2).float()  # [T, C, OH, OW]
     frames_t = TF.resize(frames_t, [H_in, W_in], antialias=True)         # [T, C, H_in, W_in]
-    frames_t = (frames_t / 255.0 - 0.5) / 0.5                            # normalize [-1, 1]
+    frames_t = (frames_t / 255.0 - _mean.view(1, 3, 1, 1)) / _std.view(1, 3, 1, 1)
 
     # → [1, C, T, H, W]
     vd = frames_t.permute(1, 0, 2, 3).unsqueeze(0).to(DEVICE)
@@ -160,10 +169,19 @@ print(f"Trainable params in head: {n_params:,}")
 # --- Feature diversity check ---
 MAX_PAIRWISE = 2000
 
+def _is_vjepa(enc):
+    # V-JEPA ViT returns temporally-multi-packed tokens ([B, n_temp*spat*spat, D])
+    # and exposes _vjepa_n_temp on the head.  Swin / VideoMAE encoders return
+    # plain spatial token grids (no temporal dim to fold), so they pass through.
+    from vjepa_encoder import VJEPA2Encoder
+    return isinstance(enc, VJEPA2Encoder)
+
 def _temporal_avg(feat):
-    if head._is_swin:
+    enc = head.encoder
+    if not _is_vjepa(enc):
         return feat
-    return feat.reshape(feat.shape[0], head._vjepa_n_temp, -1, feat.shape[-1]).mean(dim=1)
+    n_temp = head._vjepa_n_temp
+    return feat.reshape(feat.shape[0], n_temp, -1, feat.shape[-1]).mean(dim=1)
 
 def _sim_report(t, label):
     flat = t.reshape(-1, t.shape[-1])

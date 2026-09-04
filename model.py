@@ -24,6 +24,7 @@ import torch.nn.functional as F
 
 from vjepa_encoder import VJEPA2Encoder, build_vjepa2_encoder
 from swin_encoder import SwinEncoder, build_swin_encoder
+from video_mae_encoder import VideoMAEEncoder, build_videomae_encoder
 
 # ---------------------------------------------------------------------------
 # Mamba_ssm import
@@ -1119,10 +1120,13 @@ class MultiHeadVJEPA(nn.Module):
 # Factories
 # ===========================================================================
 def _build_encoder(cfg):
-    """Build the spatial encoder (V-JEPA ViT or Swin 3D) based on ``model_name``."""
+    """Build the spatial encoder (V-JEPA ViT, Swin 3D, or VideoMAE ViT-S)
+    based on ``model_name``."""
     model_name = cfg.get("model_name", "vit_base")
     if model_name.startswith("swin"):
         return build_swin_encoder(cfg)
+    if model_name.startswith(("mae", "videomae")):
+        return build_videomae_encoder(cfg)
     return build_vjepa2_encoder(cfg)
 
 

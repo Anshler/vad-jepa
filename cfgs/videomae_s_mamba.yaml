@@ -1,0 +1,60 @@
+# --------------------------------------------------------------------
+# DAPT-VideoMAE-S (simple-tad) + MOVAD — Mamba temporal model
+#
+# Frozen DAPT-VideoMAE-S encoder (simple-tad backbone, domain-adapted on
+# BDD100K+CAP-DATA, never seen DoTA) + 3 Mamba2 blocks temporal model.
+# Mirrors simple-tad's DoTA augmentation recipe (simpletad mode).
+# NF=16, VCL=28 → 12 scored frames per sub-batch (≈ nf4/vcl16's 12).
+# --------------------------------------------------------------------
+
+# --- Encoder: DAPT-VideoMAE-S -------------------------------------------
+model_name: videomae_s            # dispatch → build_videomae_encoder
+img_size: 224
+num_frames: 16
+tubelet_size: 2
+patch_size: 16
+checkpoint_path: ./pretrained/simpletad_dapt_videomae-s_ep12.pth
+checkpoint_key: model
+compile: false
+
+# --- Temporal model -------------------------------------------------------
+temporal_model: mamba
+dim_latent: 1024
+dropout: 0.3
+rnn_cell_num: 3                     # number of Mamba blocks (= num layers)
+mamba_d_state: 128
+mamba_d_conv: 4
+mamba_expand: 2
+mamba_version: mamba2               # Mamba2 (default in SlotSSM repo)
+
+# --- Data -----------------------------------------------------------------
+NF: 16
+VCL: 28
+
+data_mean: [0.485, 0.456, 0.406]    # ImageNet — VideoMAE/simple-tad norm
+data_std: [0.229, 0.224, 0.225]
+data_path: ./data/dota
+dataset: Dota
+image_shape: [720, 1280]
+input_shape: [224, 224]             # simple-tad crop size (VideoMAE 224)
+FPS: 10
+
+# --- Augmentation ---------------------------------------------------------
+augmentation_mode: simpletad        # RandAugment + RandomErasing (simple-tad DoTA recipe)
+horizontal_flip_prob: 0.5
+vertical_flip_prob: 0.0
+
+# --- Training -------------------------------------------------------------
+batch_size: 32
+class_weights: [0.3, 0.7]
+epochs: 200
+lr: 0.00005
+snapshot_interval: 10
+enable_validation: true
+validation_epoch_step: 10
+num_workers: 4
+
+amp_dtype: bf16                      # bf16 (AMP mixed-precision), fp16, or fp32 (no AMP)
+
+# --- Output ---------------------------------------------------------------
+output: ./output
