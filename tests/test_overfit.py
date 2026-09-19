@@ -36,12 +36,15 @@ parser.add_argument("--config", default="cfgs/swin_mamba.yaml",
 parser.add_argument("--checkpoint", default=None,
                     help="Override checkpoint path (uses config value if not set)")
 parser.add_argument("--epochs", type=int, default=100)
-parser.add_argument("--lr", type=float, default=0.01)
+parser.add_argument("--lr", type=float, default=0.00005)
 parser.add_argument("--train_encoder", action="store_true", default=False)
 parser.add_argument("--softmax", action="store_true", default=False,
                     help="Enable double-softmax (for comparing with old behavior)")
 parser.add_argument("--real_data", action="store_true", default=False,
                     help="Use the shortest real video from DoTA instead of synthetic data")
+parser.add_argument("--balance_weight", type=float, default=0.0,
+                    help="MoE-style load-balancing weight for the sparse gate "
+                         "(0 = off). Encourages every slot to be used.")
 args = parser.parse_args()
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -60,6 +63,7 @@ cfg.checkpoint_path = args.checkpoint or cfg.get("checkpoint_path")
 cfg.compile = False
 cfg.lr = args.lr
 cfg.train_encoder = args.train_encoder
+cfg.balance_weight = args.balance_weight
 cfg._head_cfgs_flat = [dict(cfg)]
 cfg._head_cfgs_flat[0]["name"] = "test_head"
 
@@ -249,9 +253,15 @@ for epoch in range(args.epochs):
         for p in head.parameters():
             if p.grad is not None and p.grad.norm().item() > 1e-10:
                 grads_ok += 1
+        # Gate-specific: before the straight-through fix these were exactly 0.
+        _gg = [p.grad.norm().item() for n, p in head.named_parameters()
+               if ".gate." in n and p.grad is not None]
+        _gate_str = (f"  gate_grad_max={max(_gg):.2e} n_gate={len(_gg)}"
+                     if _gg else "  gate_grad_max=N/A (no gate)")
         print(f"  ep {epoch+1:3d}: loss={avg_loss:.6f}"
               f"  pred_range=[{all_preds.min():.4f}, {all_preds.max():.4f}]"
-              f"  mean={all_preds.mean():.4f}  n_frames={all_preds.shape[1]}  params_w_grad={grads_ok}")
+              f"  mean={all_preds.mean():.4f}  n_frames={all_preds.shape[1]}"
+              f"  params_w_grad={grads_ok}{_gate_str}")
 
 final_loss = avg_loss
 learned = abs(final_loss - 0.693) > 0.02 and final_loss < 0.65

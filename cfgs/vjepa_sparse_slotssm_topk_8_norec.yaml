@@ -1,4 +1,5 @@
 # --------------------------------------------------------------------
+# BASELINE (recency_lambda=0) — A/B pair for the recency-penalty run
 # V-JEPA 2.1 + MOVAD — Sparse SlotSSM temporal model  (~21M trainable)
 #
 # K=32 slots × D=512, 4 blocks, top-k=4, Mamba2.  Inactive slots
@@ -30,9 +31,7 @@ eps_random: 0.05                    # ε-random activation (anti-dead-slots)
 balance_weight: 0.0                 # weighted aux loss OFF — kept as an ablation arm;
                                     # it measures cross-video diversity, not the
                                     # within-video temporal coverage that fails (§1g)
-recency_lambda: 1.0               # least-recently-used bias: forces slot turnover.
-                                    # eff_K 17.9->27.0/32, static 0.70->0.09 in
-                                    # the sticky-sequence harness (validate_recency_rule.py)
+recency_lambda: 0.0                 # baseline: no turnover penalty
 recency_rho: 0.9                    # recency EMA decay (0.5 -> maximal turnover)
 mamba_d_state: 128
 mamba_d_conv: 4

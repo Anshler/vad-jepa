@@ -13,7 +13,7 @@ img_size: 384
 num_frames: 4
 tubelet_size: 2
 patch_size: 16
-checkpoint_path: ./pretrained/vjepa2_1_vitb_dist_vitG_384.pt
+checkpoint_path: /home/chrysenberg/vjepa2-checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
 checkpoint_key: ema_encoder
 vjepa_spatial_grid: [6, 6]
 compile: false
@@ -27,7 +27,13 @@ slot_dim: 512                       # D — (d_model*expand/headdim)=1024/64=16,
 num_ssm_blocks: 4
 top_k: 4                           # active slots per timestep (50% — matches RIMs minimum for hard tasks)
 eps_random: 0.05                    # ε-random activation (anti-dead-slots)
-entropy_weight: 0.01                # entropy penalty (anti-routing-collapse)
+balance_weight: 0.0                 # weighted aux loss OFF — kept as an ablation arm;
+                                    # it measures cross-video diversity, not the
+                                    # within-video temporal coverage that fails (§1g)
+recency_lambda: 1.0               # least-recently-used bias: forces slot turnover.
+                                    # eff_K 17.9->27.0/32, static 0.70->0.09 in
+                                    # the sticky-sequence harness (validate_recency_rule.py)
+recency_rho: 0.9                    # recency EMA decay (0.5 -> maximal turnover)
 mamba_d_state: 128
 mamba_d_conv: 4
 mamba_expand: 2
@@ -39,7 +45,7 @@ NF: 4
 VCL: 8
 
 data_mean: [0.5, 0.5, 0.5]
-data_path: ./data/dota
+data_path: /mnt/d/Users/Chrysenberg69420/Downloads/DoTA_dataset
 data_std: [0.5, 0.5, 0.5]
 dataset: Dota
 image_shape: [720, 1280]

@@ -241,7 +241,8 @@ def train(cfg, model, traindata_loader, begin_epoch,
         for k in ("dim_latent", "dropout", "rnn_state_size", "rnn_cell_num",
                    "mamba_d_state", "mamba_d_conv", "mamba_expand", "mamba_version",
                    "num_slots", "slot_dim", "num_ssm_blocks", "top_k", "eps_random",
-                   "use_inverted_attention", "entropy_weight"):
+                   "use_inverted_attention", "balance_weight",
+                   "recency_lambda", "recency_rho"):
             if k in hc:
                 head_cfgs[name][k] = hc[k]
 
@@ -353,11 +354,14 @@ def train(cfg, model, traindata_loader, begin_epoch,
 
             loss = criterion[head_name](output, target)
 
-            entropy_weight = head_cfgs[head_name].get("entropy_weight", 0.0)
-            if entropy_weight > 0 and hasattr(head, "temporal") and hasattr(head.temporal, "_entropy"):
-                ent = head.temporal._entropy
-                if isinstance(ent, torch.Tensor) and ent.item() > 0:
-                    loss = loss + entropy_weight * (-ent)
+            # MoE-style load balancing: keeps every slot in use.  Without it the
+            # gate starves slots (coverage 0.46 at top_k=4), which is what made
+            # the sparse gate worse than random routing.
+            balance_weight = head_cfgs[head_name].get("balance_weight", 0.0)
+            if balance_weight > 0 and hasattr(head, "temporal") and hasattr(head.temporal, "_balance"):
+                bal = head.temporal._balance
+                if isinstance(bal, torch.Tensor) and bal.item() > 0:
+                    loss = loss + balance_weight * bal
 
             if hasattr(head, "temporal") and hasattr(head.temporal, "_slot_mass_min"):
                 _mass_min = head.temporal._slot_mass_min

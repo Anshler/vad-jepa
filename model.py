@@ -362,6 +362,27 @@ class MambaTemporalModel(nn.Module):
 # ===========================================================================
 
 
+def _attn_reduce(w, grid=None):
+    """Reduce an averaged-over-heads attention map ``[B, T, S]`` to per-query stats.
+
+    Returns ``(entropy, max_weight, centroid)`` where entropy/max are ``[B, T]``
+    and centroid is ``[B, T, 2]`` (row, col) when ``grid`` is given and matches
+    ``S``, else ``None``.  Full maps are never kept — a [K, N] map per step per
+    block over thousands of frames is hundreds of MB.
+    """
+    p = w.clamp_min(0)
+    p = p / (p.sum(dim=-1, keepdim=True) + 1e-12)
+    ent = -(p * (p + 1e-12).log()).sum(dim=-1)
+    mx = p.max(dim=-1).values
+    cent = None
+    if grid is not None and grid[0] * grid[1] == p.shape[-1]:
+        gh, gw = grid
+        ys = torch.arange(gh, dtype=p.dtype, device=p.device).repeat_interleave(gw)
+        xs = torch.arange(gw, dtype=p.dtype, device=p.device).repeat(gh)
+        cent = torch.stack([(p * ys).sum(-1), (p * xs).sum(-1)], dim=-1)
+    return ent, mx, cent
+
+
 class SlotSSMBlock(nn.Module):
     """
     One SlotSSM block — matches the reference repo 1:1.
@@ -402,12 +423,19 @@ class SlotSSMBlock(nn.Module):
         mamba_version: str = "mamba2", num_heads: int = 4, block_idx: int = 0,
         eps_random: float = 0.0,
         use_inverted_attention: bool = False,
+        balance_weight: float = 0.0,
+        num_slots: int = 32,
+        recency_lambda: float = 0.0,
+        recency_rho: float = 0.9,
     ):
         super().__init__()
         _require_mamba()
         self.top_k = top_k
+        self.num_slots = num_slots
         self.eps_random = eps_random
         self.use_inverted_attention = use_inverted_attention
+        # MoE-style load-balancing weight; 0 disables it (no behaviour change).
+        self.balance_weight = balance_weight
         mamba_cls = Mamba2 if mamba_version == "mamba2" else Mamba
 
         self.input_proj = nn.Linear(input_dim, slot_dim, bias=False)
@@ -443,11 +471,40 @@ class SlotSSMBlock(nn.Module):
                 nn.Linear(slot_dim, 1, bias=False),
             )
         self._gate_entropy = torch.tensor(0.0)  # accumulated per forward pass
+        self._gate_balance = torch.tensor(0.0)  # load-balancing term (0 if disabled)
+
+        # --- DeepSeek-style aux-loss-free load balancing -------------------
+        # A detached per-slot bias added to the gate scores before top-k, nudged
+        # by  b_i += gamma * sign(target - f_i).  The bias affects SELECTION only
+        # and is never differentiated, which is what lets it act on TEMPORAL
+        # usage: the SSM state carries no gradient across frames (the in-place
+        # step() kernels are inference-only), so a loss-based balancer cannot
+        # reach a multi-frame statistic at all.
+        # --- Recency penalty (least-recently-used bias) --------------------
+        # Suppress slots that were active recently, forcing turnover.  Unlike a
+        # constant load-balancing bias, this is STATE-DEPENDENT, which is what
+        # lets it correct a state-driven concentration: measured on a sticky
+        # synthetic sequence it raised effective_K from 17.9 to 29.6 of 32 and
+        # cut static_frac from 0.70 to 0.09.  Gradient-free, so it works despite
+        # the SSM state carrying no gradient across frames.
+        self.recency_lambda = recency_lambda
+        self.recency_rho = recency_rho
+        self._recency = None      # transient per-sample EMA, never checkpointed
+
 
         # --- Diagnostics (populated during forward when _diag_enabled=True) ---
         self._diag_enabled = False
         self._diag_gate_scores: list = []   # [B, K] per step
         self._diag_active_idx: list = []    # [B, top_k] per step
+        self._diag_cross: list = []         # per step: (entropy [B,K], max [B,K], centroid [B,K,2])
+        self._diag_self: list = []          # per step: (entropy [B,tk], read_mass [B,K])
+        self._diag_slot_delta: list = []    # per step: [B, K] L2 change of each slot
+        # Optional callable(gate_scores, active_idx) -> active_idx, used by
+        # routing interventions (random / round-robin / frozen).  None = learned
+        # top-k, i.e. exactly the production path.
+        self._route_override = None
+        # Spatial grid (rows, cols) of the patch tokens, for attention centroids.
+        self._diag_grid = None
 
         # Per-slot Mamba
         kw = dict(d_model=slot_dim, d_state=mamba_d_state, d_conv=mamba_d_conv,
@@ -492,6 +549,13 @@ class SlotSSMBlock(nn.Module):
             self._slot_usage_frac = self.cross_attn._slot_usage_frac
         elif _HAS_FLASH_ATTN:
             out = self.cross_attn(x=q, x_kv=kv)
+        elif self._diag_enabled:
+            # nn.MultiheadAttention already computes the map; keep only reduced
+            # per-slot stats so memory stays flat over long videos.
+            out, w = self.cross_attn(q, kv, kv, need_weights=True)
+            ent, mx, cent = _attn_reduce(w.detach(), grid=self._diag_grid)
+            self._diag_cross.append((ent.cpu(), mx.cpu(),
+                                     cent.cpu() if cent is not None else None))
         else:
             out = self.cross_attn(q, kv, kv)[0]
         return out
@@ -564,7 +628,13 @@ class SlotSSMBlock(nn.Module):
         x_flat = x.reshape(B * K, D)                            # [B*K, D]
         q = x_flat[active_flat].reshape(B, -1, D)              # [B, active_slots, D]
 
-        out_active = self.self_attn(q, kv, kv)[0]
+        if self._diag_enabled:
+            out_active, w = self.self_attn(q, kv, kv, need_weights=True)
+            w = w.detach()                                     # [B, active, K]
+            ent, _, _ = _attn_reduce(w)
+            self._diag_self.append((ent.cpu(), w.sum(dim=1).cpu()))
+        else:
+            out_active = self.self_attn(q, kv, kv)[0]
 
         out = torch.zeros(B, K, D, device=slots.device, dtype=out_active.dtype)
         out_flat = out.reshape(B * K, D)
@@ -582,6 +652,7 @@ class SlotSSMBlock(nn.Module):
 
         # === Sparse: only top-k active slots update ===
         B, K, D = slots.shape
+        prev_slots = slots          # input state, for the per-slot delta measure
         layer_idx = self.mamba.layer_idx
         has_prev = layer_idx in cache.key_value_memory_dict
 
@@ -595,15 +666,97 @@ class SlotSSMBlock(nn.Module):
         informed = slots + cross_out
         gate_scores = self.gate(informed).squeeze(-1)                # [B, K]
 
+        # ``p`` is the differentiable gate distribution; the *selection* stays
+        # hard top-k.  The gate is trained through two paths:
+        #   (1) the straight-through mask below (forward = hard 0/1, backward
+        #       flows through p), and
+        #   (2) the entropy term, which is no longer detached.
+        # Previously gate_scores reached only .topk() (indices, no gradient) and
+        # a detached entropy, so the gate received ZERO gradient and stayed at
+        # its xavier init — it was a fixed random projection, not a learned gate.
+        p = gate_scores.softmax(dim=-1)                              # [B, K]
+
         if self.training and self.eps_random > 0 and torch.rand(1).item() < self.eps_random:
             active_idx = torch.stack([torch.randperm(K, device=slots.device)[:self.top_k]
                                        for _ in range(B)])
             self._gate_entropy = gate_scores.new_tensor(float(math.log(K)))
+            self._gate_balance = gate_scores.new_tensor(0.0)
+            _ste = False        # selection is not the gate's — no gradient for it
         else:
-            _, active_idx = gate_scores.topk(self.top_k, dim=1)      # [B, top_k]
-            p = gate_scores.softmax(dim=-1)                           # [B, K]
+            # Corrections steer SELECTION only; p (used for the STE mask and
+            # the entropy diagnostic) stays the unbiased gate distribution, so
+            # the gate MLP learns from the task loss independently of them.
+            shift = None
+            if self.recency_lambda > 0 and self._recency is not None:
+                r = -self.recency_lambda * self._recency
+                shift = r if shift is None else shift + r
+            biased = gate_scores if shift is None else gate_scores + shift
+            _, active_idx = biased.topk(self.top_k, dim=1)           # [B, top_k]
             entropy = -(p * (p + 1e-9).log()).sum(dim=-1).mean()     # scalar
+            # Diagnostic-only (reported by get_diagnostics and the mechanism
+            # script), so detached: as a LOSS term it was useless — a near-uniform
+            # softmax still picks the same top-k, since top-k depends on ORDER not
+            # magnitude, so it cannot see slot starvation (93% of max entropy at
+            # 0.64 coverage).  See findings §1e.
             self._gate_entropy = entropy.detach()
+            # MoE-style load balancing (Switch/GShard form), so slots are not
+            # starved: f from the hard mask (no grad), P differentiable, so
+            # gradients reach the gate only through P — as in the literature.
+            #
+            # Normalised to the excess over the uniform minimum.  That minimum
+            # is top_k, NOT 1: at uniform routing each of K slots is selected by
+            # a fraction top_k/K of frames, so K*sum(f*P) = top_k.  It equals K
+            # at full collapse.  So the raw form ranges [top_k, K], and dividing
+            # by (K - top_k) maps 0 = balanced .. 1 = collapsed for any top_k.
+            #
+            # Normalising also matters for scale: the raw form's gradient
+            # (measured 54 on gate[1].weight, top_k=8) swamps the task gradient
+            # (~0.006) by ~90x at weight 0.01.
+            if self.balance_weight > 0 and self.top_k < K:
+                with torch.no_grad():
+                    hard_oh = torch.zeros_like(p).scatter_(1, active_idx, 1.0)
+                f = hard_oh.mean(dim=0)
+                raw = K * (f * p.mean(dim=0)).sum()
+                self._gate_balance = (raw - self.top_k) / (K - self.top_k)
+            else:
+                self._gate_balance = gate_scores.new_tensor(0.0)
+            _ste = True
+
+        # --- Routing interventions (diagnostics only; None = learned top-k) ---
+        if self._route_override is not None:
+            active_idx = self._route_override(gate_scores, active_idx, self)
+
+        # Straight-through mask: forward value is the hard top-k mask, backward
+        # passes through p, so the hard selection is trainable.  Built AFTER the
+        # override so it matches the selection actually used, and detached when
+        # that selection is not the gate's own (eps_random, diagnostic overrides)
+        # — otherwise the gate would be trained to imitate random routing.
+        with torch.no_grad():
+            hard = torch.zeros_like(p).scatter_(1, active_idx, 1.0)
+        mask_ste = (hard + p - p.detach()
+                    if (_ste and self._route_override is None) else hard)
+
+        # --- aux-loss-free balancing: accumulate per-sample TEMPORAL usage ---
+        # f_i = mean over this sample's frames of the fraction of batch items
+        # that activated slot i.  A temporal statistic — which is the actual
+        # failure mode (within-video starvation).  The weighted aux loss could
+        # only ever see cross-video diversity, since its f was averaged over the
+        # batch, which here is one frame from each of B different videos.
+        # seqlen_offset == 0 marks a fresh sample (the loop resets state per
+        # video), so that is where the previous sample's usage is applied.
+        # Recency EMA: reset at a sample boundary (seqlen_offset == 0 marks the
+        # first frame, since the loop passes a fresh state per video).  Runs at
+        # eval too — this is an inference-time scheduling mechanism, not a
+        # trained quantity — but not under a diagnostic routing override.
+        if self.recency_lambda > 0 and _ste and self._route_override is None:
+            cur = hard.mean(dim=0)
+            if (self._recency is None or cache.seqlen_offset == 0
+                    or self._recency.device != slots.device):
+                self._recency = cur
+            else:
+                self._recency = (self.recency_rho * self._recency
+                                 + (1.0 - self.recency_rho) * cur)
+
 
         # --- Diagnostics: capture gate scores and active indices ---
         if self._diag_enabled:
@@ -615,13 +768,19 @@ class SlotSSMBlock(nn.Module):
         #     fall through to the mask-based path (same as before).
         if not has_prev:
             mask = torch.zeros(B, K, device=slots.device, dtype=slots.dtype).scatter_(1, active_idx, 1.0)
-            mask_3d = mask.unsqueeze(-1)
             active_flat = mask.reshape(-1).bool()
+            # STE mask: same forward value as `mask`, gradient flows to the gate.
+            mask_3d = mask_ste.unsqueeze(-1)
             slots = slots + cross_out * mask_3d
             x_all = self.time_mixer_norm(slots).reshape(-1, 1, D)
             full_out = self.mamba(x_all, inference_params=cache).reshape(B, K, D)
             slots = slots + full_out * mask_3d
             slots = slots + self._self_attn_sparse(slots, active_flat)
+            if self._diag_enabled:
+                # Record here too, so slot_delta stays index-aligned with
+                # gate_scores / active_idx (this branch returns early).
+                self._diag_slot_delta.append(
+                    (slots - prev_slots).detach().norm(dim=-1).cpu())
             return slots
 
         # === Subsequent steps: compact active-slot path -------------------
@@ -634,11 +793,11 @@ class SlotSSMBlock(nn.Module):
         batch_idx = torch.arange(B, device=slots.device).unsqueeze(1)   # [B, 1]
 
         # 3. Compact active slots — integer indexing → contiguous
-        compact_slots = slots[batch_idx, active_idx]                     # [B, tk, D]
+        prev_active = slots[batch_idx, active_idx]                       # [B, tk, D]
         compact_cross = cross_out[batch_idx, active_idx]                 # [B, tk, D]
 
         # 4. Cross-attn update (dense on compact, no mask)
-        compact_slots = compact_slots + compact_cross
+        compact_slots = prev_active + compact_cross
 
         # 5. Mamba on compact active slots
         x_compact = self.time_mixer_norm(compact_slots).reshape(-1, 1, D)  # [B*tk, 1, D]
@@ -651,16 +810,41 @@ class SlotSSMBlock(nn.Module):
         kv[1][idx_flat] = ssm_active
         compact_slots = compact_slots + out_active.squeeze(1).reshape(B, tk, D)
 
-        # 6. Self-attn: compact Q queries full slots as KV (read-only memory)
+        # 6. Write the compact update back BEFORE self-attn, so the KV reflects
+        #    post-update slots exactly as the dense path does.  Inactive slots
+        #    are untouched, so only the active rows were stale.  Doing this
+        #    scatter *after* self-attn (as before) fed it PRE-update KV, which
+        #    made the sparse path a different function from dense even at
+        #    top_k=K — verified: top_k=32 then differed from dense by 0.6
+        #    relative, and matches to 0 once the KV is fresh.
+        slots = torch.index_put(slots, (batch_idx, active_idx), compact_slots)
+
+        # 7. Self-attn: compact Q queries full slots as KV (read-only memory)
         compact_q = self.space_attn_norm(compact_slots)                # [B, tk, D]
         full_kv = self.space_attn_norm(slots)                           # [B, K, D]
-        sa_out = self.self_attn(compact_q, full_kv, full_kv)[0]        # [B, tk, D]
+        if self._diag_enabled:
+            sa_out, w = self.self_attn(compact_q, full_kv, full_kv,
+                                       need_weights=True)              # w: [B, tk, K]
+            w = w.detach()
+            ent, _, _ = _attn_reduce(w)
+            read_mass = w.sum(dim=1)                                   # [B, K] mass each slot receives
+            self._diag_self.append((ent.cpu(), read_mass.cpu()))
+        else:
+            sa_out = self.self_attn(compact_q, full_kv, full_kv)[0]    # [B, tk, D]
         compact_slots = compact_slots + sa_out
 
-        # 7. Scatter compact back into full slots (only active indices change).
-        #     Clone to avoid in-place on a leaf-variable view.
-        slots = slots.clone()
-        slots[batch_idx, active_idx] = compact_slots
+        # 8. Final write-back, weighted by the straight-through mask so the gate
+        #    receives gradient.  ``w_ste`` is exactly 1.0 in the forward pass, so
+        #    this is identical to the hard write while letting gradients reach p.
+        w_ste = mask_ste.gather(1, active_idx).unsqueeze(-1)           # [B, tk, 1]
+        slots = torch.index_put(
+            slots, (batch_idx, active_idx),
+            prev_active + (compact_slots - prev_active) * w_ste)
+        if self._diag_enabled:
+            # Per-slot L2 movement this step.  Inactive slots must read exactly
+            # 0 for the frozen-memory claim to hold.
+            self._diag_slot_delta.append(
+                (slots - prev_slots).detach().norm(dim=-1).cpu())
         return slots
 
 
@@ -682,6 +866,9 @@ class SlotSSMTemporalModel(nn.Module):
         mamba_version: str = "mamba2", num_heads: int = 4,
         eps_random: float = 0.0,
         use_inverted_attention: bool = False,
+        balance_weight: float = 0.0,
+        recency_lambda: float = 0.0,
+        recency_rho: float = 0.9,
     ):
         super().__init__()
         _require_mamba()
@@ -699,10 +886,15 @@ class SlotSSMTemporalModel(nn.Module):
                 num_heads=num_heads, block_idx=i,
                 eps_random=eps_random if top_k is not None else 0.0,
                 use_inverted_attention=use_inverted_attention,
+                balance_weight=balance_weight if top_k is not None else 0.0,
+                num_slots=num_slots,
+                recency_lambda=recency_lambda if top_k is not None else 0.0,
+                recency_rho=recency_rho,
             )
             for i in range(num_blocks)
         ])
         self._entropy = torch.tensor(0.0)  # populated during forward
+        self._balance = torch.tensor(0.0)  # populated during forward
         self._slot_mass_min = torch.tensor(float("nan"))
         self._slot_mass_mean = torch.tensor(float("nan"))
         self._slot_usage_frac = torch.tensor(float("nan"))
@@ -710,13 +902,25 @@ class SlotSSMTemporalModel(nn.Module):
         # --- Diagnostic collection (opt-in, off by default) ---
         self._diag_slots: list | None = None   # final slot states [B, K, D] per step
 
-    def enable_diagnostics(self):
-        """Enable per-step collection of gate scores, active indices, and slot states."""
+    def enable_diagnostics(self, grid=None, collect_slots=False):
+        """Enable per-step collection of gate scores, active indices, and slot states.
+
+        ``grid`` is the (rows, cols) spatial layout of the patch tokens, needed
+        for attention centroids.  Pass None to skip centroid/Self-attn capture.
+
+        ``collect_slots`` stores the full ``[B, K, D]`` slot state every step,
+        which is ~1 GB over a few thousand frames at K=32/D=512 — it defaults to
+        off, since ``slot_delta`` already captures per-slot movement.
+        """
         for blk in self.blocks:
             blk._diag_enabled = True
             blk._diag_gate_scores = []
             blk._diag_active_idx = []
-        self._diag_slots = []
+            blk._diag_cross = []
+            blk._diag_self = []
+            blk._diag_slot_delta = []
+            blk._diag_grid = grid
+        self._diag_slots = [] if collect_slots else None
 
     def disable_diagnostics(self):
         """Disable diagnostic collection and free stored data."""
@@ -724,7 +928,20 @@ class SlotSSMTemporalModel(nn.Module):
             blk._diag_enabled = False
             blk._diag_gate_scores = []
             blk._diag_active_idx = []
+            blk._diag_cross = []
+            blk._diag_self = []
+            blk._diag_slot_delta = []
         self._diag_slots = []
+
+    def set_route_override(self, fn):
+        """Install ``fn(gate_scores, active_idx, block) -> active_idx`` on every block.
+
+        Used by routing interventions (random / round-robin / frozen).  The block
+        is passed so an override can keep per-block state.  ``None`` restores the
+        learned top-k path.
+        """
+        for blk in self.blocks:
+            blk._route_override = fn
 
     def get_diagnostics(self) -> dict:
         """Return collected diagnostics after a forward pass.
@@ -748,6 +965,10 @@ class SlotSSMTemporalModel(nn.Module):
             "mass_min": float(self._slot_mass_min),
             "mass_mean": float(self._slot_mass_mean),
             "usage_frac": float(self._slot_usage_frac),
+            # Added by diag_sparse_gate_topk.py — empty when grid was not passed
+            "cross": [list(blk._diag_cross) for blk in self.blocks],
+            "self_attn": [list(blk._diag_self) for blk in self.blocks],
+            "slot_delta": [list(blk._diag_slot_delta) for blk in self.blocks],
         }
 
     def forward(self, patches, cache: MambaCache | None = None):
@@ -757,11 +978,14 @@ class SlotSSMTemporalModel(nn.Module):
 
         slots = self.slots_init.expand(B, -1, -1)
         ent = 0.0
+        bal = 0.0
         for blk in self.blocks:
             slots = blk(slots, patches, cache)
             if blk.top_k is not None:
                 ent = ent + blk._gate_entropy
-        self._entropy = ent  # training loop reads this
+                bal = bal + blk._gate_balance
+        self._entropy = ent    # training loop reads this
+        self._balance = bal    # load-balancing term (0 unless balance_weight > 0)
 
         # Aggregate inverted cross-attn diagnostics across blocks (worst-case)
         self._slot_mass_min = min(blk._slot_mass_min for blk in self.blocks)
@@ -797,6 +1021,9 @@ class ClsVJEPA(nn.Module):
         # Sparse SlotSSM
         top_k: int = 16,
         eps_random: float = 0.0,
+        balance_weight: float = 0.0,
+        recency_lambda: float = 0.0,
+        recency_rho: float = 0.9,
         # Inverted attention (SlotSSM reference repo style)
         use_inverted_attention: bool = False,
         train_encoder: bool = False,
@@ -874,6 +1101,9 @@ class ClsVJEPA(nn.Module):
                 mamba_expand=mamba_expand, mamba_version=mamba_version,
                 eps_random=eps_random if is_sparse else 0.0,
                 use_inverted_attention=use_inverted_attention,
+                balance_weight=balance_weight if is_sparse else 0.0,
+                recency_lambda=recency_lambda if is_sparse else 0.0,
+                recency_rho=recency_rho,
             )
 
             # Learned attention-pool over slots (640 params — negligible).
@@ -1083,6 +1313,9 @@ class MultiHeadVJEPA(nn.Module):
                 num_ssm_blocks=head_cfg.get("num_ssm_blocks", 4),
                 top_k=head_cfg.get("top_k", 16),
                 eps_random=head_cfg.get("eps_random", 0.0),
+                balance_weight=head_cfg.get("balance_weight", 0.0),
+                recency_lambda=head_cfg.get("recency_lambda", 0.0),
+                recency_rho=head_cfg.get("recency_rho", 0.9),
                 use_inverted_attention=head_cfg.get("use_inverted_attention", False),
                 train_encoder=train_encoder,
                 vjepa_spatial_grid=head_cfg.get("vjepa_spatial_grid", None),
@@ -1155,6 +1388,9 @@ def build_cls_vjepa(cfg) -> ClsVJEPA:
         num_ssm_blocks=cfg.get("num_ssm_blocks", 4),
         top_k=cfg.get("top_k", 16),
         eps_random=cfg.get("eps_random", 0.0),
+        balance_weight=cfg.get("balance_weight", 0.0),
+        recency_lambda=cfg.get("recency_lambda", 0.0),
+        recency_rho=cfg.get("recency_rho", 0.9),
         use_inverted_attention=cfg.get("use_inverted_attention", False),
         train_encoder=cfg.get("train_encoder", False),
         vjepa_spatial_grid=cfg.get("vjepa_spatial_grid", None),
