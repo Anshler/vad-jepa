@@ -36,6 +36,12 @@ recency_lambda: 0.0                 # OFF — measured to HURT AUC (-0.011 at k=
                                     # Code retained: one-line re-enable for a
                                     # VCL=64 test of the turnover hypothesis.
 recency_rho: 0.9                    # recency EMA decay (0.5 -> maximal turnover)
+gumbel_sigma: 0.3                   # Fix B: Gumbel exploration on the gate's
+                                    # SELECTION scores (training-only).  Breaks
+                                    # rich-get-richer by trying slots just below
+                                    # the cutoff.  Gate score spread is ~0.7, so
+                                    # keep < 1.0 (1.0 = near-random selection).
+                                    # 0 = off.  UNVALIDATED effect.
 mamba_d_state: 128
 mamba_d_conv: 4
 mamba_expand: 2
