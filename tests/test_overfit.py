@@ -45,6 +45,17 @@ parser.add_argument("--real_data", action="store_true", default=False,
 parser.add_argument("--balance_weight", type=float, default=0.0,
                     help="MoE-style load-balancing weight for the sparse gate "
                          "(0 = off). Encourages every slot to be used.")
+parser.add_argument("--eps_random", type=float, default=None,
+                    help="Override eps_random. Dense forces 0, so setting 0 here "
+                         "isolates how much of the sparse/dense loss gap is the "
+                         "routing noise sparse trains with.")
+parser.add_argument("--seed", type=int, default=42,
+                    help="Init seed. Run 3 seeds before believing any loss gap: this "
+                         "is an 8-label memorisation task and convergence is very "
+                         "init-sensitive.")
+parser.add_argument("--top_k", type=int, default=None,
+                    help="Override top_k. top_k == num_slots makes the sparse path "
+                         "equivalent to dense (verified to 5e-07).")
 args = parser.parse_args()
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -52,8 +63,8 @@ apply_softmax = args.softmax
 print(f"Device: {DEVICE}  |  train_encoder={args.train_encoder}  |  lr={args.lr}"
       f"  |  epochs={args.epochs}  |  softmax={apply_softmax}  |  real_data={args.real_data}")
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed(args.seed)
 
 # --- Build model ---
 cfg_path = os.path.join(_REPO_ROOT, args.config)
@@ -64,6 +75,10 @@ cfg.compile = False
 cfg.lr = args.lr
 cfg.train_encoder = args.train_encoder
 cfg.balance_weight = args.balance_weight
+if args.eps_random is not None:
+    cfg.eps_random = args.eps_random
+if args.top_k is not None:
+    cfg.top_k = args.top_k
 cfg._head_cfgs_flat = [dict(cfg)]
 cfg._head_cfgs_flat[0]["name"] = "test_head"
 
@@ -205,6 +220,7 @@ toa_batch = di[:, 2]
 tea_batch = di[:, 3]
 video_len_orig = di[:, 0]
 
+epoch_losses = []
 for epoch in range(args.epochs):
     state = None
     epoch_loss = 0.0
@@ -235,6 +251,7 @@ for epoch in range(args.epochs):
         frame_count += 1
 
     avg_loss = epoch_loss / max(frame_count, 1)
+    epoch_losses.append(avg_loss)
 
     if epoch == 0 or (epoch + 1) % 10 == 0:
         with torch.no_grad():
@@ -264,6 +281,11 @@ for epoch in range(args.epochs):
               f"  params_w_grad={grads_ok}{_gate_str}")
 
 final_loss = avg_loss
+min_loss = min(epoch_losses)
+tail = sum(epoch_losses[-10:]) / len(epoch_losses[-10:])
 learned = abs(final_loss - 0.693) > 0.02 and final_loss < 0.65
 status = "✓ LEARNED" if learned else "✗ STUCK"
-print(f"\n=> {status}  final_loss={final_loss:.6f}")
+print(f"\n=> {status}  final_loss={final_loss:.6f}  min_loss={min_loss:.6f}"
+      f"  tail10_mean={tail:.6f}")
+print("   (final_loss is a single epoch and is noisy; compare configs on"
+      " min_loss / tail10_mean)")
