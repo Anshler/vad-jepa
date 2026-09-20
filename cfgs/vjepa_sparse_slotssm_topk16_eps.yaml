@@ -1,0 +1,78 @@
+# --------------------------------------------------------------------
+# ARM B — eps_random ONLY (Fix A). The random subset carries the STE gradient,
+# so this is eps-greedy exploration WITH learning. Uniform-subset exploration:
+# large perturbation, costs fitting capacity (measured 3/3 seeds).
+# V-JEPA 2.1 + MOVAD — Sparse SlotSSM temporal model  (~21M trainable)
+#
+# K=32 slots × D=512, 4 blocks, top-k=4, Mamba2.  Inactive slots
+# are read-only memory (preserved bit-for-bit across steps); active
+# slots read from them via self-attention KV.  ε-random and entropy
+# regularization prevent dead slots and routing collapse.
+# --------------------------------------------------------------------
+
+# --- V-JEPA 2.1 encoder ---------------------------------------------------
+model_name: vit_base
+img_size: 384
+num_frames: 4
+tubelet_size: 2
+patch_size: 16
+checkpoint_path: /home/chrysenberg/vjepa2-checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
+checkpoint_key: ema_encoder
+vjepa_spatial_grid: [6, 6]
+compile: false
+
+# --- Temporal model -------------------------------------------------------
+temporal_model: sparse_slotssm
+dim_latent: 1024
+dropout: 0.3
+num_slots: 32                       # K — total slot modules
+slot_dim: 512                       # D — (d_model*expand/headdim)=1024/64=16, 16%8=0 ✓
+num_ssm_blocks: 4
+top_k: 16                           # active slots per timestep (50% — matches RIMs minimum for hard tasks)
+eps_random: 0.05                # exploration arm (see header)
+balance_weight: 0.0                 # weighted aux loss OFF — kept as an ablation arm;
+                                    # it measures cross-video diversity, not the
+                                    # within-video temporal coverage that fails (§1g)
+recency_lambda: 0.0                 # OFF — measured to HURT AUC (-0.011 at k=4,
+                                    # -0.013 at k=16, paired) and to flip
+                                    # gate-input corr NEGATIVE. See §1j/§1k.
+                                    # Code retained: one-line re-enable for a
+                                    # VCL=64 test of the turnover hypothesis.
+recency_rho: 0.9                    # recency EMA decay (0.5 -> maximal turnover)
+gumbel_sigma: 0.0                 # exploration arm (see header)
+mamba_d_state: 128
+mamba_d_conv: 4
+mamba_expand: 2
+mamba_version: mamba2
+use_inverted_attention: false        # standard cross-attn (FlashMHA-compatible)
+
+# --- Data -----------------------------------------------------------------
+NF: 4
+VCL: 8
+
+data_mean: [0.5, 0.5, 0.5]
+data_path: ./data/dota
+data_std: [0.5, 0.5, 0.5]
+dataset: Dota
+image_shape: [720, 1280]
+input_shape: [384, 384]
+FPS: 10
+
+# --- Training -------------------------------------------------------------
+batch_size: 32
+class_weights: [0.3, 0.7]
+epochs: 200
+lr: 0.00005
+snapshot_interval: 10
+enable_validation: true
+validation_epoch_step: 10
+num_workers: 4
+
+amp_dtype: bf16                      # bf16 (AMP mixed-precision), fp16, or fp32 (no AMP)
+
+# --- Augmentation ---------------------------------------------------------
+horizontal_flip_prob: 0.5
+vertical_flip_prob: 0.0
+
+# --- Output ---------------------------------------------------------------
+output: ./output

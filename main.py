@@ -242,7 +242,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
                    "mamba_d_state", "mamba_d_conv", "mamba_expand", "mamba_version",
                    "num_slots", "slot_dim", "num_ssm_blocks", "top_k", "eps_random",
                    "use_inverted_attention", "balance_weight",
-                   "recency_lambda", "recency_rho"):
+                   "recency_lambda", "recency_rho", "gumbel_sigma"):
             if k in hc:
                 head_cfgs[name][k] = hc[k]
 

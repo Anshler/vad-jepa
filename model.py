@@ -383,6 +383,21 @@ def _attn_reduce(w, grid=None):
     return ent, mx, cent
 
 
+def _slot_sim(s):
+    """Mean off-diagonal cosine similarity of [B, K, D] slot states.
+
+    High = slots are redundant (interchangeable); low = slots have specialised.
+    Returned per batch item so active/inactive subsets can be compared.
+    """
+    x = s / (s.norm(dim=-1, keepdim=True) + 1e-9)
+    sim = torch.bmm(x, x.transpose(1, 2))                      # [B, K, K]
+    K = sim.shape[-1]
+    if K < 2:
+        return s.new_zeros(s.shape[0])
+    off = sim - torch.eye(K, device=sim.device, dtype=sim.dtype).unsqueeze(0)
+    return off.sum(dim=(1, 2)) / (K * (K - 1))                 # [B]
+
+
 class SlotSSMBlock(nn.Module):
     """
     One SlotSSM block — matches the reference repo 1:1.
@@ -427,6 +442,7 @@ class SlotSSMBlock(nn.Module):
         num_slots: int = 32,
         recency_lambda: float = 0.0,
         recency_rho: float = 0.9,
+        gumbel_sigma: float = 0.0,
     ):
         super().__init__()
         _require_mamba()
@@ -491,6 +507,9 @@ class SlotSSMBlock(nn.Module):
         self.recency_rho = recency_rho
         self._recency = None      # transient per-sample EMA, never checkpointed
 
+        # Gumbel exploration scale (0 = off).  Training-only; see Fix B below.
+        self.gumbel_sigma = gumbel_sigma
+
 
         # --- Diagnostics (populated during forward when _diag_enabled=True) ---
         self._diag_enabled = False
@@ -499,6 +518,7 @@ class SlotSSMBlock(nn.Module):
         self._diag_cross: list = []         # per step: (entropy [B,K], max [B,K], centroid [B,K,2])
         self._diag_self: list = []          # per step: (entropy [B,tk], read_mass [B,K])
         self._diag_slot_delta: list = []    # per step: [B, K] L2 change of each slot
+        self._diag_slot_sim: list = []      # per step: (all, active, inactive) mean cos-sim
         # Optional callable(gate_scores, active_idx) -> active_idx, used by
         # routing interventions (random / round-robin / frozen).  None = learned
         # top-k, i.e. exactly the production path.
@@ -641,6 +661,20 @@ class SlotSSMBlock(nn.Module):
         out_flat[active_flat] = out_active.reshape(-1, D)
         return out
 
+    @staticmethod
+    def _sim_triple(slots, active_mask):
+        """(all, active-only, inactive-only) mean pairwise cos-sim, as CPU tensors."""
+        with torch.no_grad():
+            all_s = _slot_sim(slots)
+            m = active_mask
+            # Boolean-mask indexing on [B,K,D] flattens to [n, D], so re-add the
+            # batch dim before computing pairwise similarity.
+            act = (_slot_sim(slots[m].unsqueeze(0)) if m.sum() > 1
+                   else slots.new_zeros(1))
+            inact = (_slot_sim(slots[~m].unsqueeze(0)) if (~m).sum() > 1
+                     else slots.new_zeros(1))
+        return (all_s.cpu(), act.cpu(), inact.cpu())
+
     # ------------------------------------------------------------------
     def forward(self, slots, ref_raw, cache: MambaCache):
         if self.top_k is None:
@@ -681,7 +715,18 @@ class SlotSSMBlock(nn.Module):
                                        for _ in range(B)])
             self._gate_entropy = gate_scores.new_tensor(float(math.log(K)))
             self._gate_balance = gate_scores.new_tensor(0.0)
-            _ste = False        # selection is not the gate's — no gradient for it
+            # Fix A: KEEP the STE gradient on eps_random steps.  The random
+            # subset's update IS computed and IS evaluated, so the loss reduction
+            # genuinely says whether those slots were useful.  Flowing gradient
+            # here turns this from wasted noise into eps-greedy EXPLORATION with
+            # learning: the gate discovers slots it would never have picked.
+            #
+            # This is the fix for rich-get-richer.  The STE can only reach
+            # SELECTED slots (an unselected slot's delta is never computed, so
+            # there is nothing to evaluate), which is why the gate previously
+            # only ever learned about slots it already chose.  eps_random is the
+            # one mechanism that evaluates a slot the gate did not choose.
+            _ste = True
         else:
             # Corrections steer SELECTION only; p (used for the STE mask and
             # the entropy diagnostic) stays the unbiased gate distribution, so
@@ -691,6 +736,15 @@ class SlotSSMBlock(nn.Module):
                 r = -self.recency_lambda * self._recency
                 shift = r if shift is None else shift + r
             biased = gate_scores if shift is None else gate_scores + shift
+            # Fix B: Gumbel exploration.  Perturb the SELECTION scores so slots
+            # just below the cutoff get tried — far more informative per step than
+            # eps_random's uniformly random subset.  Training-only, and the STE
+            # still flows through the clean p, so this explores without biasing
+            # the learning signal.  sigma is additive; the gate score spread is
+            # ~0.7 (from the entropy), so keep sigma well below that.
+            if self.training and self.gumbel_sigma > 0 and self._route_override is None:
+                u = torch.rand_like(biased).clamp_min(1e-20)
+                biased = biased + self.gumbel_sigma * (-torch.log(-torch.log(u)))
             _, active_idx = biased.topk(self.top_k, dim=1)           # [B, top_k]
             entropy = -(p * (p + 1e-9).log()).sum(dim=-1).mean()     # scalar
             # Diagnostic-only (reported by get_diagnostics and the mechanism
@@ -728,9 +782,9 @@ class SlotSSMBlock(nn.Module):
 
         # Straight-through mask: forward value is the hard top-k mask, backward
         # passes through p, so the hard selection is trainable.  Built AFTER the
-        # override so it matches the selection actually used, and detached when
-        # that selection is not the gate's own (eps_random, diagnostic overrides)
-        # — otherwise the gate would be trained to imitate random routing.
+        # override so it matches the selection actually used.  Detached only
+        # under a diagnostic override, where the selection is the script's, not
+        # the gate's.  (eps_random steps deliberately DO carry gradient — Fix A.)
         with torch.no_grad():
             hard = torch.zeros_like(p).scatter_(1, active_idx, 1.0)
         mask_ste = (hard + p - p.detach()
@@ -781,6 +835,7 @@ class SlotSSMBlock(nn.Module):
                 # gate_scores / active_idx (this branch returns early).
                 self._diag_slot_delta.append(
                     (slots - prev_slots).detach().norm(dim=-1).cpu())
+                self._diag_slot_sim.append(self._sim_triple(slots, mask.bool()))
             return slots
 
         # === Subsequent steps: compact active-slot path -------------------
@@ -845,6 +900,7 @@ class SlotSSMBlock(nn.Module):
             # 0 for the frozen-memory claim to hold.
             self._diag_slot_delta.append(
                 (slots - prev_slots).detach().norm(dim=-1).cpu())
+            self._diag_slot_sim.append(self._sim_triple(slots, hard.bool()))
         return slots
 
 
@@ -869,6 +925,7 @@ class SlotSSMTemporalModel(nn.Module):
         balance_weight: float = 0.0,
         recency_lambda: float = 0.0,
         recency_rho: float = 0.9,
+        gumbel_sigma: float = 0.0,
     ):
         super().__init__()
         _require_mamba()
@@ -890,6 +947,7 @@ class SlotSSMTemporalModel(nn.Module):
                 num_slots=num_slots,
                 recency_lambda=recency_lambda if top_k is not None else 0.0,
                 recency_rho=recency_rho,
+                gumbel_sigma=gumbel_sigma if top_k is not None else 0.0,
             )
             for i in range(num_blocks)
         ])
@@ -919,6 +977,7 @@ class SlotSSMTemporalModel(nn.Module):
             blk._diag_cross = []
             blk._diag_self = []
             blk._diag_slot_delta = []
+            blk._diag_slot_sim = []
             blk._diag_grid = grid
         self._diag_slots = [] if collect_slots else None
 
@@ -931,6 +990,7 @@ class SlotSSMTemporalModel(nn.Module):
             blk._diag_cross = []
             blk._diag_self = []
             blk._diag_slot_delta = []
+            blk._diag_slot_sim = []
         self._diag_slots = []
 
     def set_route_override(self, fn):
@@ -969,6 +1029,7 @@ class SlotSSMTemporalModel(nn.Module):
             "cross": [list(blk._diag_cross) for blk in self.blocks],
             "self_attn": [list(blk._diag_self) for blk in self.blocks],
             "slot_delta": [list(blk._diag_slot_delta) for blk in self.blocks],
+            "slot_sim": [list(blk._diag_slot_sim) for blk in self.blocks],
         }
 
     def forward(self, patches, cache: MambaCache | None = None):
@@ -1024,6 +1085,7 @@ class ClsVJEPA(nn.Module):
         balance_weight: float = 0.0,
         recency_lambda: float = 0.0,
         recency_rho: float = 0.9,
+        gumbel_sigma: float = 0.0,
         # Inverted attention (SlotSSM reference repo style)
         use_inverted_attention: bool = False,
         train_encoder: bool = False,
@@ -1104,6 +1166,7 @@ class ClsVJEPA(nn.Module):
                 balance_weight=balance_weight if is_sparse else 0.0,
                 recency_lambda=recency_lambda if is_sparse else 0.0,
                 recency_rho=recency_rho,
+                gumbel_sigma=gumbel_sigma if is_sparse else 0.0,
             )
 
             # Learned attention-pool over slots (640 params — negligible).
@@ -1316,6 +1379,7 @@ class MultiHeadVJEPA(nn.Module):
                 balance_weight=head_cfg.get("balance_weight", 0.0),
                 recency_lambda=head_cfg.get("recency_lambda", 0.0),
                 recency_rho=head_cfg.get("recency_rho", 0.9),
+                gumbel_sigma=head_cfg.get("gumbel_sigma", 0.0),
                 use_inverted_attention=head_cfg.get("use_inverted_attention", False),
                 train_encoder=train_encoder,
                 vjepa_spatial_grid=head_cfg.get("vjepa_spatial_grid", None),
@@ -1391,6 +1455,7 @@ def build_cls_vjepa(cfg) -> ClsVJEPA:
         balance_weight=cfg.get("balance_weight", 0.0),
         recency_lambda=cfg.get("recency_lambda", 0.0),
         recency_rho=cfg.get("recency_rho", 0.9),
+        gumbel_sigma=cfg.get("gumbel_sigma", 0.0),
         use_inverted_attention=cfg.get("use_inverted_attention", False),
         train_encoder=cfg.get("train_encoder", False),
         vjepa_spatial_grid=cfg.get("vjepa_spatial_grid", None),
