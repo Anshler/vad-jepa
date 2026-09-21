@@ -36,11 +36,17 @@ recency_lambda: 0.0                 # OFF — measured to HURT AUC (-0.011 at k=
                                     # Code retained: one-line re-enable for a
                                     # VCL=64 test of the turnover hypothesis.
 recency_rho: 0.9                    # recency EMA decay (0.5 -> maximal turnover)
-gumbel_sigma: 0.3                   # Fix B: Gumbel exploration on the gate's
-                                    # SELECTION scores (training-only).  Breaks
-                                    # rich-get-richer by trying slots just below
-                                    # the cutoff.  Gate score spread is ~0.7, so
-                                    # keep < 1.0 (1.0 = near-random selection).
+gumbel_sigma: 0.0                   # OFF — measured to do nothing useful (§15.2).
+                                    # It barely moved coverage (dead slots 1.75 ->
+                                    # 1.50 vs eps_random's 1.75 -> 0.00), made
+                                    # static_frac slightly WORSE (0.0796 -> 0.0908),
+                                    # made the cutoff LESS decisive (margin 0.261 ->
+                                    # 0.159, near-tie frames 51% -> 59%), and partly
+                                    # undid eps_random when combined (both: dead 1.25,
+                                    # usage CV 32.1 vs eps alone's 0.00 / 25.8).
+                                    # Mechanistically it can only re-roll among slots
+                                    # already near the cutoff, so it cannot reach a
+                                    # starved slot by construction.  Code retained.
                                     # 0 = off.  UNVALIDATED effect.
 mamba_d_state: 128
 mamba_d_conv: 4
