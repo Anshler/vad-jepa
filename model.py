@@ -86,7 +86,8 @@ class MultiHeadAttention(nn.Module):
 
     def __init__(
         self, d_model, num_heads, dropout=0.0, inverted=False, bias=True,
-        norm_over_input=True, epsilon=1e-5,
+        norm_over_input=True, epsilon=1e-5, logit_scale=1.0,
+        logit_scale_learnable=False,
     ):
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
@@ -95,6 +96,37 @@ class MultiHeadAttention(nn.Module):
         self.inverted = inverted
         self.norm_over_input = norm_over_input
         self.epsilon = epsilon
+        # Multiplies the attention logits before the softmax. 1.0 is neutral and
+        # reproduces the original behaviour exactly.
+        #
+        # This is the INVERSE of the conventional softmax temperature:
+        # softmax(z*T) == softmax(z / (1/T)), so T=4 means tau=0.25. If you
+        # implement it as softmax(logits / tau), you want tau = 1/T.
+        #
+        # Why it matters here: the standard softmax runs over patches, and its
+        # logits span only ~0.49 sd across the 36 patches. The softmax's natural
+        # scale is 1, so that is nearly flat -- each slot effectively averages
+        # over ~32 of 36 patches, i.e. it receives the patch mean regardless of
+        # its query. Every slot therefore gets the same input, so slots become
+        # near-copies and the sparse gate has nothing to discriminate.
+        # Scaling the logits to ~2 sd makes the top patches dominate, and slots
+        # with different queries then bind different patches.
+        # Measured (tests/check_inverted_attn.py): out_sim 0.78 at 1.0,
+        # 0.45 at 2.0, 0.15 at 4.0, 0.06 at 8.0.
+        self.logit_scale = float(logit_scale)
+        # Learnable variant: one scalar PER HEAD, initialized to logit_scale.
+        # Preferred to a hand-picked constant because it lets the model report
+        # where it wants to sit rather than us guessing -- and a learned value
+        # near the init is evidence the flatness was never a problem.
+        # NOTE: the training optimizer is plain SGD with momentum and NO weight
+        # decay, so this parameter is not pulled toward 0. If weight decay is ever
+        # added, exclude this parameter from it.
+        self.logit_scale_learnable = bool(logit_scale_learnable)
+        if self.logit_scale_learnable:
+            self.logit_scale_param = nn.Parameter(
+                torch.full((num_heads,), float(logit_scale)))
+        else:
+            self.logit_scale_param = None
 
         self.attn_dropout = nn.Dropout(dropout)
         self.output_dropout = nn.Dropout(dropout)
@@ -118,7 +150,18 @@ class MultiHeadAttention(nn.Module):
         v_proj = self.proj_v(v).view(B, S, self.num_heads, -1).transpose(1, 2)
 
         q_proj = q_proj * (q_proj.shape[-1] ** (-0.5))
-        attn = torch.matmul(q_proj, k_proj.transpose(-1, -2))
+        # Per-head scale when learnable, else the fixed scalar.
+        scale = (self.logit_scale_param.view(1, -1, 1, 1)
+                 if self.logit_scale_param is not None else self.logit_scale)
+        attn = torch.matmul(q_proj, k_proj.transpose(-1, -2)) * scale
+
+        # Keep the pre-softmax logits (detached, diagnostic-only). The spread of
+        # this tensor ACROSS TARGETS is what decides how selective the softmax
+        # is: the softmax's natural scale is 1, so a spread well below 1 means
+        # near-uniform attention regardless of the queries. That is the quantity
+        # logit_scale acts on, and it depends on the learned projection weights,
+        # so it has to be measured per model rather than assumed.
+        self._last_logits = attn.detach()
 
         if self.inverted:
             # Softmax over (head * target) → features compete over slots
@@ -142,6 +185,12 @@ class MultiHeadAttention(nn.Module):
                 attn = attn / (attn.sum(dim=-1, keepdim=True) + self.epsilon)
         else:
             attn = F.softmax(attn, dim=-1)
+
+        # Keep the map for offline inspection (detached, diagnostic-only).  The
+        # inverted path's whole claim is that patches compete for slots, which is
+        # a statement about this tensor; without it the claim can only be
+        # inferred from the mass scalars above.
+        self._last_attn = attn.detach()
 
         attn = self.attn_dropout(attn)
         output = torch.matmul(attn, v_proj).transpose(1, 2).reshape(B, T, -1)
@@ -191,26 +240,26 @@ def _weights_init(m):
         if m.bias is not None:
             torch.nn.init.constant_(m.bias, 0)
     if isinstance(m, nn.MultiheadAttention):
-            # in_proj_weight is a raw Parameter, not inside an nn.Linear, so the
-            # branch above never sees it and it keeps nn.MultiheadAttention's own
-            # xavier_uniform_. For the FUSED [3D, D] matrix that uses fan_out = 3D, so
-            # the bound is sqrt(6/(D+3D)) instead of the sqrt(6/(D+D)) a separate
-            # [D, D] Linear would get -- a factor sqrt(2) smaller per projection, and
-            # therefore 0.5 in the logit spread, since a logit is a product of two
-            # projections.
-            #
-            # Measured: logit_sd 0.489 here vs 0.983 for the reference repo's
-            # separate proj_q/proj_k Linears. That is the whole difference between
-            # this repo's cross-attention and the reference's, and it is an INIT
-            # difference only -- the two compute the same function on the same
-            # weights (tests/_check_mha_equiv.py, bit-identical).
-            #
-            # gain=sqrt(2) restores the scale the nn.Linear branch intends, so the
-            # fused parameter no longer silently gets a different effective gain.
-            # Biases are already zeroed by nn.MultiheadAttention._reset_parameters;
-            # repeated here so this branch fully owns the parameter.
-            torch.nn.init.xavier_uniform_(m.in_proj_weight, gain=math.sqrt(2))
-            torch.nn.init.constant_(m.in_proj_bias, 0)
+        # in_proj_weight is a raw Parameter, not inside an nn.Linear, so the
+        # branch above never sees it and it keeps nn.MultiheadAttention's own
+        # xavier_uniform_. For the FUSED [3D, D] matrix that uses fan_out = 3D, so
+        # the bound is sqrt(6/(D+3D)) instead of the sqrt(6/(D+D)) a separate
+        # [D, D] Linear would get -- a factor sqrt(2) smaller per projection, and
+        # therefore 0.5 in the logit spread, since a logit is a product of two
+        # projections.
+        #
+        # Measured: logit_sd 0.489 here vs 0.983 for the reference repo's
+        # separate proj_q/proj_k Linears. That is the whole difference between
+        # this repo's cross-attention and the reference's, and it is an INIT
+        # difference only -- the two compute the same function on the same
+        # weights (tests/_check_mha_equiv.py, bit-identical).
+        #
+        # gain=sqrt(2) restores the scale the nn.Linear branch intends, so the
+        # fused parameter no longer silently gets a different effective gain.
+        # Biases are already zeroed by nn.MultiheadAttention._reset_parameters;
+        # repeated here so this branch fully owns the parameter.
+        torch.nn.init.xavier_uniform_(m.in_proj_weight, gain=math.sqrt(2))
+        torch.nn.init.constant_(m.in_proj_bias, 0)
     if isinstance(m, nn.LSTMCell):
         for param in m.parameters():
             if len(param.shape) >= 2:
@@ -464,6 +513,8 @@ class SlotSSMBlock(nn.Module):
         recency_lambda: float = 0.0,
         recency_rho: float = 0.9,
         gumbel_sigma: float = 0.0,
+        logit_scale: float = 1.0,
+        logit_scale_learnable: bool = False,
     ):
         super().__init__()
         _require_mamba()
@@ -471,6 +522,11 @@ class SlotSSMBlock(nn.Module):
         self.num_slots = num_slots
         self.eps_random = eps_random
         self.use_inverted_attention = use_inverted_attention
+        # Multiplies the cross-attention logits before the softmax. 1.0 is
+        # neutral. Applies to BOTH the dense and sparse paths, because the
+        # cross-attention is shared -- the flat attention it corrects is upstream
+        # of the top_k split, so it cannot be made sparse-only. See findings 15.9.
+        self.logit_scale = float(logit_scale)
         # MoE-style load-balancing weight; 0 disables it (no behaviour change).
         self.balance_weight = balance_weight
         mamba_cls = Mamba2 if mamba_version == "mamba2" else Mamba
@@ -482,13 +538,22 @@ class SlotSSMBlock(nn.Module):
         #  - standard:  FlashMHA when available, else nn.MultiheadAttention
         self.cross_attn_input_norm = nn.LayerNorm(slot_dim)
         self.cross_attn_ref_norm = nn.LayerNorm(slot_dim)
-        if use_inverted_attention:
+        # The custom module is required whenever logit_scale != 1: neither
+        # FlashMHA nor nn.MultiheadAttention exposes the logits, so the scale
+        # cannot be applied through them. It also returns the attention map, which
+        # keeps the cross-attention diagnostics working on this path.
+        self.logit_scale_learnable = bool(logit_scale_learnable)
+        self._cross_attn_custom = (use_inverted_attention or logit_scale != 1.0
+                                   or logit_scale_learnable)
+        if self._cross_attn_custom:
             # Single head matches the reference repo default (train.py:122):
             #   encoder_attn_num_heads=1  # for inverted attn to encourage object segmentation
             self.cross_attn = MultiHeadAttention(
-                d_model=slot_dim, num_heads=num_heads, inverted=True,
+                d_model=slot_dim, num_heads=num_heads,
+                inverted=use_inverted_attention, logit_scale=logit_scale,
+                logit_scale_learnable=logit_scale_learnable,
             )
-            self._cross_attn_inverted = True
+            self._cross_attn_inverted = use_inverted_attention
         elif _HAS_FLASH_ATTN:
             self.cross_attn = FlashMHA(embed_dim=slot_dim, num_heads=num_heads, cross_attn=True)
             self._cross_attn_inverted = False
@@ -530,6 +595,17 @@ class SlotSSMBlock(nn.Module):
 
         # Gumbel exploration scale (0 = off).  Training-only; see Fix B below.
         self.gumbel_sigma = gumbel_sigma
+
+        # Reproduce the pre-fix forward (bfaa73a) at inference: build the
+        # self-attn KV from PRE-update slot states.  This is the ONLY
+        # inference-relevant difference between bfaa73a and HEAD in the sparse
+        # path -- the STE, eps_random, gumbel, recency and balance changes are
+        # gradient-only or training-only, and the write-back form was measured
+        # to have exactly zero effect (see step 8 in forward()).  Off everywhere
+        # except the compatibility evaluation of a pre-fix checkpoint.
+        # Verified faithful to bfaa73a by tests/check_prefix_forward.py, which
+        # diffs it against the real bfaa73a:model.py at one bf16 ULP.
+        self.legacy_stale_kv = False
 
 
         # --- Diagnostics (populated during forward when _diag_enabled=True) ---
@@ -582,12 +658,29 @@ class SlotSSMBlock(nn.Module):
         ref_proj = self.input_proj(ref_raw)                       # [B, N, D]
         q = self.cross_attn_input_norm(slots)                     # [B, K, D]
         kv = self.cross_attn_ref_norm(ref_proj)                   # [B, N, D]
-        if self._cross_attn_inverted:
+        if self._cross_attn_custom:
+            # Custom module: positional args, returns a tensor, and keeps its map
+            # as _last_attn (detached).  Used for the inverted path AND whenever
+            # logit_scale != 1, since FlashMHA/nn.MultiheadAttention cannot apply
+            # a logit scale.
             out = self.cross_attn(q, kv, kv)
-            # Forward diagnostics from the inverted MultiHeadAttention
-            self._slot_mass_min = self.cross_attn._slot_mass_min
-            self._slot_mass_mean = self.cross_attn._slot_mass_mean
-            self._slot_usage_frac = self.cross_attn._slot_usage_frac
+            if self._cross_attn_inverted:
+                # Forward diagnostics from the inverted MultiHeadAttention
+                self._slot_mass_min = self.cross_attn._slot_mass_min
+                self._slot_mass_mean = self.cross_attn._slot_mass_mean
+                self._slot_usage_frac = self.cross_attn._slot_usage_frac
+            if self._diag_enabled:
+                # Recover the same reduced stats the nn.MultiheadAttention branch
+                # produces, from the map the custom module kept.  Head-averaged to
+                # match that branch's [B, T, S] shape, so the numbers stay
+                # comparable across paths.
+                w = getattr(self.cross_attn, '_last_attn', None)
+                if w is not None:
+                    ent, mx, cent = _attn_reduce(w.mean(dim=1),
+                                                 grid=self._diag_grid)
+                    self._diag_cross.append(
+                        (ent.cpu(), mx.cpu(),
+                         cent.cpu() if cent is not None else None))
         elif _HAS_FLASH_ATTN:
             out = self.cross_attn(x=q, x_kv=kv)
         elif self._diag_enabled:
@@ -654,6 +747,17 @@ class SlotSSMBlock(nn.Module):
 
     def _self_attn_all(self, slots):
         x = self.space_attn_norm(slots)
+        if self._diag_enabled and not _HAS_FLASH_ATTN:
+            # Dense read profile.  Same reduction as _self_attn_sparse, so the
+            # "how much mass does slot j receive" column is directly comparable
+            # between the dense and sparse paths.  FlashMHA cannot return
+            # weights, so this only exists for the eager module — which is what
+            # dense instantiates when flash-attn is absent (see __init__).
+            out, w = self.self_attn(x, x, x, need_weights=True)
+            w = w.detach()                                         # [B, K, K]
+            ent, _, _ = _attn_reduce(w)
+            self._diag_self.append((ent.cpu(), w.sum(dim=1).cpu()))
+            return out
         result = self.self_attn(x) if _HAS_FLASH_ATTN else self.self_attn(x, x, x)[0]
         return result
 
@@ -700,9 +804,20 @@ class SlotSSMBlock(nn.Module):
     def forward(self, slots, ref_raw, cache: MambaCache):
         if self.top_k is None:
             # === Dense: all slots update (reference SlotSSM) ===
+            prev_slots = slots      # input state, for the per-slot delta measure
             slots = slots + self._cross_attn(slots, ref_raw)
             slots = slots + self._mamba_step(slots, cache)
             slots = slots + self._self_attn_all(slots)
+            if self._diag_enabled:
+                # Record the same two quantities the sparse path records, so
+                # dense and sparse are directly comparable.  Dense has no gate,
+                # so every slot is "active": the active column equals the all
+                # column and the inactive set is empty (recorded as 0).
+                self._diag_slot_delta.append(
+                    (slots - prev_slots).detach().norm(dim=-1).cpu())
+                all_active = torch.ones(slots.shape[:2], device=slots.device,
+                                        dtype=torch.bool)
+                self._diag_slot_sim.append(self._sim_triple(slots, all_active))
             return slots
 
         # === Sparse: only top-k active slots update ===
@@ -893,11 +1008,20 @@ class SlotSSMBlock(nn.Module):
         #    made the sparse path a different function from dense even at
         #    top_k=K — verified: top_k=32 then differed from dense by 0.6
         #    relative, and matches to 0 once the KV is fresh.
+        kv_source = slots        # pre-update states, for legacy_stale_kv below
         slots = torch.index_put(slots, (batch_idx, active_idx), compact_slots)
 
         # 7. Self-attn: compact Q queries full slots as KV (read-only memory)
         compact_q = self.space_attn_norm(compact_slots)                # [B, tk, D]
-        full_kv = self.space_attn_norm(slots)                           # [B, K, D]
+        # ``legacy_stale_kv`` reproduces the pre-fix forward exactly (bfaa73a):
+        # it built this KV from the PRE-update slot states, so the active rows
+        # were stale.  This exists only so a checkpoint trained under that
+        # forward can be evaluated under the code it was trained with.  Without
+        # it, such a checkpoint is a train/test forward mismatch and its AUC
+        # under the fixed code is comparable to nothing — see findings §1.5.
+        # It is never set during training or normal evaluation.
+        full_kv = self.space_attn_norm(kv_source if self.legacy_stale_kv
+                                       else slots)                      # [B, K, D]
         if self._diag_enabled:
             sa_out, w = self.self_attn(compact_q, full_kv, full_kv,
                                        need_weights=True)              # w: [B, tk, K]
@@ -912,6 +1036,14 @@ class SlotSSMBlock(nn.Module):
         # 8. Final write-back, weighted by the straight-through mask so the gate
         #    receives gradient.  ``w_ste`` is exactly 1.0 in the forward pass, so
         #    this is identical to the hard write while letting gradients reach p.
+        #
+        #    The pre-fix forward wrote ``compact_slots`` directly instead of
+        #    round-tripping through prev + (new - prev) * 1.0.  That looked like
+        #    it should matter under bf16 (catastrophic cancellation), so it was
+        #    implemented as a separate legacy flag and measured: it changes the
+        #    result by EXACTLY nothing -- both forms give 0.7583 pooled AUC on
+        #    the seed-42 40-video subset, to four decimals, with identical mean
+        #    video AUC.  So the branch was removed rather than kept as dead code.
         w_ste = mask_ste.gather(1, active_idx).unsqueeze(-1)           # [B, tk, 1]
         slots = torch.index_put(
             slots, (batch_idx, active_idx),
@@ -947,12 +1079,20 @@ class SlotSSMTemporalModel(nn.Module):
         recency_lambda: float = 0.0,
         recency_rho: float = 0.9,
         gumbel_sigma: float = 0.0,
+        logit_scale: float = 1.0,
+        logit_scale_learnable: bool = False,
     ):
         super().__init__()
         _require_mamba()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
         self.top_k = top_k
+        # NOTE: not gated on top_k, unlike eps_random/gumbel/balance/recency.
+        # Those live in the sparse gate, so they can be sparse-only. The flat
+        # cross-attention this corrects is in the shared block, upstream of the
+        # dense/sparse split, so it applies to both. See findings 15.9.
+        self.logit_scale = float(logit_scale)
+        self.logit_scale_learnable = bool(logit_scale_learnable)
 
         self.slots_init = nn.Parameter(torch.randn(1, num_slots, slot_dim) * 0.02)
 
@@ -969,6 +1109,8 @@ class SlotSSMTemporalModel(nn.Module):
                 recency_lambda=recency_lambda if top_k is not None else 0.0,
                 recency_rho=recency_rho,
                 gumbel_sigma=gumbel_sigma if top_k is not None else 0.0,
+                logit_scale=logit_scale,
+                logit_scale_learnable=logit_scale_learnable,
             )
             for i in range(num_blocks)
         ])
@@ -1109,6 +1251,12 @@ class ClsVJEPA(nn.Module):
         gumbel_sigma: float = 0.0,
         # Inverted attention (SlotSSM reference repo style)
         use_inverted_attention: bool = False,
+        # Multiplies the cross-attention logits before the softmax. 1.0 = neutral.
+        # Applies to dense and sparse alike (shared block). See findings 15.9.
+        logit_scale: float = 1.0,
+        # Learn one logit scale PER HEAD instead of fixing it, initialized to
+        # logit_scale. Lets the model report where it wants to sit.
+        logit_scale_learnable: bool = False,
         train_encoder: bool = False,
         # V-JEPA spatial-grid mode (keep patch tokens, pool spatially like Swin)
         vjepa_spatial_grid: tuple | None = None,
@@ -1188,6 +1336,8 @@ class ClsVJEPA(nn.Module):
                 recency_lambda=recency_lambda if is_sparse else 0.0,
                 recency_rho=recency_rho,
                 gumbel_sigma=gumbel_sigma if is_sparse else 0.0,
+                logit_scale=logit_scale,
+                logit_scale_learnable=logit_scale_learnable,
             )
 
             # Learned attention-pool over slots (640 params — negligible).
@@ -1402,6 +1552,8 @@ class MultiHeadVJEPA(nn.Module):
                 recency_rho=head_cfg.get("recency_rho", 0.9),
                 gumbel_sigma=head_cfg.get("gumbel_sigma", 0.0),
                 use_inverted_attention=head_cfg.get("use_inverted_attention", False),
+                logit_scale=head_cfg.get("logit_scale", 1.0),
+                logit_scale_learnable=head_cfg.get("logit_scale_learnable", False),
                 train_encoder=train_encoder,
                 vjepa_spatial_grid=head_cfg.get("vjepa_spatial_grid", None),
                 patch_size=head_cfg.get("patch_size", 16),
@@ -1478,6 +1630,8 @@ def build_cls_vjepa(cfg) -> ClsVJEPA:
         recency_rho=cfg.get("recency_rho", 0.9),
         gumbel_sigma=cfg.get("gumbel_sigma", 0.0),
         use_inverted_attention=cfg.get("use_inverted_attention", False),
+        logit_scale=cfg.get("logit_scale", 1.0),
+        logit_scale_learnable=cfg.get("logit_scale_learnable", False),
         train_encoder=cfg.get("train_encoder", False),
         vjepa_spatial_grid=cfg.get("vjepa_spatial_grid", None),
         patch_size=cfg.get("patch_size", 16),
