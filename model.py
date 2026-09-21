@@ -515,6 +515,11 @@ class SlotSSMBlock(nn.Module):
         gumbel_sigma: float = 0.0,
         logit_scale: float = 1.0,
         logit_scale_learnable: bool = False,
+        slot_input_gain: bool = False,
+        slot_input_proj_rank: int = 0,
+        slot_state_decay: bool = False,
+        gate_reads_state: bool = False,
+        gate_state_init: float = 0.0,
     ):
         super().__init__()
         _require_mamba()
@@ -566,12 +571,149 @@ class SlotSSMBlock(nn.Module):
         self._slot_mass_mean = torch.tensor(float("nan"))
         self._slot_usage_frac = torch.tensor(float("nan"))
 
+        # --- Per-slot differentiation ---------------------------------------
+        # Why: the recurrent state homogenises across slots (cross-slot cos-sim
+        # 0.60 on real video, against the slot state's 0.28) and attention
+        # sharpening does NOT reach it (0.610 -> 0.607 over scale 1->3). The
+        # cause looks like the SHARED dynamics: every slot runs the same
+        # recurrence with the same weights, so states converge to a common
+        # trajectory. So each slot needs its own dynamics.
+        #
+        # Deliberately implemented WITHOUT touching the Mamba: no monkeypatching,
+        # no overriding mamba internals, no hooks on in_proj, no A_log/kernel
+        # changes. Everything below is an ordinary tensor op on a tensor this
+        # block already owns, applied to the Mamba's input or to the state the
+        # caller already writes back.
+        #
+        # Two constraints on where the modulation can go:
+        #  * AFTER time_mixer_norm -- LayerNorm normalises each slot's vector
+        #    independently, so anything applied before it is normalised away.
+        #  * it must change the recurrence's BALANCE (history vs current input),
+        #    not just an output scale: cosine similarity is invariant to positive
+        #    scaling, so a pure magnitude change is invisible to the metric that
+        #    measures differentiation.
+        #
+        # All three are initialised DIFFERENTIATED, not at the neutral value.
+        # A neutral init would rely on the task gradient to create the
+        # difference, and the task gradient has no reason to (findings 15.8).
+        # A differentiated init is also more likely to survive: the init fix
+        # showed training preserves the init's regime (0.978 -> 0.993).
+        self.slot_input_gain = bool(slot_input_gain)
+        self.slot_input_proj_rank = int(slot_input_proj_rank)
+        self.slot_state_decay = bool(slot_state_decay)
+
+        if self.slot_input_gain:
+            # Per-slot, per-channel input gain. Lognormal (mean 1, ~+-35%),
+            # drawn per slot so slots start with different effective timescales.
+            self.slot_gain = nn.Parameter(
+                torch.exp(0.3 * torch.randn(num_slots, slot_dim)))
+        else:
+            self.slot_gain = None
+
+        if self.slot_input_proj_rank > 0:
+            # Per-slot low-rank map into the recurrence: x <- x + U_s (V x).
+            # A matmul, so allowed; the rank keeps it affordable (~0.54M per
+            # block at r=32 vs 8.4M for a full per-slot [D, D]).
+            r = self.slot_input_proj_rank
+            self.slot_U = nn.Parameter(torch.randn(num_slots, slot_dim, r) * 0.2)
+            self.slot_V = nn.Parameter(torch.randn(r, slot_dim) / r ** 0.5)
+        else:
+            self.slot_U = None
+            self.slot_V = None
+
+        if self.slot_state_decay:
+            # Per-slot decay on the recurrent state, bounded to (0.5, 1.0) so the
+            # optimizer cannot take the degenerate route of killing the state
+            # (decay -> 0 destroys memory while looking like differentiation).
+            # Raw init is spread so slots start with different horizons.
+            self.slot_decay_raw = nn.Parameter(
+                torch.empty(num_slots).uniform_(-1.5, 1.5))
+        else:
+            self.slot_decay_raw = None
+
         # Sparse gate — only when top_k is set
         if top_k is not None:
             self.gate = nn.Sequential(
                 nn.LayerNorm(slot_dim),
                 nn.Linear(slot_dim, 1, bias=False),
             )
+
+        # --- Gate reads the recurrent state --------------------------------
+        # An extra additive term on the gate score, read from the SSM state the
+        # block wrote at the PREVIOUS step (the cache, not the current slots):
+        #
+        #     gate_scores += state_gate( mean_{H,hdim} ssm_state )     [B, K]
+        #
+        # Rationale: the gate currently scores `slots + cross_out`, which is
+        # instantaneous -- it cannot express "this slot's memory is what is
+        # arriving". A readout of the state can, in principle.
+        #
+        # Measured precondition (findings 16.7): on the trained baseline the
+        # best SINGLE direction through the state re-ranks slots by 0.0021
+        # against the gate's ~0.7 score spread (0.3%) -- nothing to read. On
+        # `slot_input_proj_rank: 32` it is 0.2422 (34.6%), which IS enough to
+        # re-rank a top-16. So this flag is only worth enabling alongside `proj`.
+        #
+        # Init is ZERO by default, so the arm starts bit-identical to `proj`
+        # alone and the term only exists if the gradient puts it there. That is
+        # the honest test: findings 15.8 showed the gradient flattens the gate
+        # when there is nothing to choose between, so a readout that stays at
+        # zero is itself the answer. `gate_state_init` (the weight sd) opens the
+        # other arm -- a random readout that perturbs selection from step 0 --
+        # at the cost of injecting the state's STATIC per-slot component, which
+        # is the `frozen` intervention findings 15.7 measured as doing nothing.
+        #
+        # Sparse-only: the term multiplies a gate score, and dense has no gate.
+        self.gate_reads_state = bool(gate_reads_state) and top_k is not None
+        self.gate_state_init = float(gate_state_init)
+
+        # `proj` is a MEASURED PRECONDITION of the readout, so refuse the
+        # combination that cannot work rather than train a guaranteed-null arm
+        # for 50 epochs and discover it later.  The numbers are in the message
+        # because this encodes an empirical fact, not a logical one: if a later
+        # measurement shows the baseline state does carry a usable slot x time
+        # signal, this check is what should be deleted.
+        if self.gate_reads_state and slot_input_proj_rank <= 0:
+            raise ValueError(
+                "gate_reads_state=True requires slot_input_proj_rank > 0. "
+                "The SSM state is only worth reading once the slots have their "
+                "own dynamics: the best single readout direction through it "
+                "re-ranks slots by 0.0021 against the gate's ~0.7 score spread "
+                "(0.3%) on the baseline, and 0.2422 (34.6%) on `proj` "
+                "(findings 16.7). Set slot_input_proj_rank: 32, or turn "
+                "gate_reads_state off.")
+        if self.gate_state_init != 0.0 and not self.gate_reads_state:
+            raise ValueError(
+                "gate_state_init only applies when gate_reads_state=True; "
+                f"got gate_state_init={self.gate_state_init} with the readout "
+                "off, where it would silently do nothing.")
+
+        if self.gate_reads_state:
+            # A raw Parameter, NOT nn.Linear, and deliberately so: ClsVJEPA
+            # applies `_weights_init` to the whole model, and its nn.Linear
+            # branch would xavier this away -- destroying the zero init that
+            # makes the arm a clean ablation.  Nothing else in _weights_init
+            # sees a bare Parameter, so this stays where it is put.
+            w = (torch.randn(1, mamba_d_state) * self.gate_state_init
+                 if self.gate_state_init != 0.0
+                 else torch.zeros(1, mamba_d_state))
+            self.state_gate = nn.Parameter(w)
+            # Normalise the readout's input, as every other projection in this
+            # block already does (`cross_attn_input_norm`, `time_mixer_norm`,
+            # `space_attn_norm`).  Measured why: the gate reads a LayerNorm'd
+            # vector of per-slot norm sqrt(512) = 22.6, while the raw state
+            # summary has norm ~0.37, so the readout's gradient came out 60x
+            # below the gate's (ratio 0.0165) and the weight needed ~350k SGD
+            # steps to reach an audible scale against a real run's ~20-80k.
+            # The 60x is very nearly the input-norm ratio, so normalising should
+            # recover most of it.  LayerNorm is NOT touched by `_weights_init`
+            # (it handles Linear / MultiheadAttention / LSTMCell only), so it
+            # keeps weight=1, bias=0 and adds no new confound.
+            self.state_norm = nn.LayerNorm(mamba_d_state)
+        else:
+            self.state_gate = None
+            self.state_norm = None
+
         self._gate_entropy = torch.tensor(0.0)  # accumulated per forward pass
         self._gate_balance = torch.tensor(0.0)  # load-balancing term (0 if disabled)
 
@@ -694,9 +836,29 @@ class SlotSSMBlock(nn.Module):
             out = self.cross_attn(q, kv, kv)[0]
         return out
 
+    def slot_decay(self):
+        """Per-slot decay in (0.5, 1.0). Only defined when slot_state_decay."""
+        return 0.5 + 0.5 * torch.sigmoid(self.slot_decay_raw)
+
+    def _slot_modulate(self, x_norm, idx=None):
+        """Per-slot input modulation, applied AFTER time_mixer_norm.
+
+        x_norm : [B, K, D] (idx=None, all slots in order) or [B, tk, D] with idx
+                 giving the slot id per position.
+        Ordinary tensor ops only -- a multiply and a matmul. No Mamba internals.
+        """
+        if self.slot_gain is not None:
+            g = self.slot_gain if idx is None else self.slot_gain[idx]
+            x_norm = x_norm * g
+        if self.slot_U is not None:
+            u = self.slot_U if idx is None else self.slot_U[idx]
+            x_norm = x_norm + torch.einsum('...d,...dr->...r', x_norm, u) @ self.slot_V
+        return x_norm
+
     def _mamba_step(self, slots, cache):
         """Run Mamba on all slots. Dense path only."""
-        x = self.time_mixer_norm(slots).reshape(-1, 1, slots.shape[-1])
+        x = self._slot_modulate(self.time_mixer_norm(slots)).reshape(
+            -1, 1, slots.shape[-1])
         return self.mamba(x, inference_params=cache).reshape_as(slots)
 
     def _mamba_step_sparse(self, slots, active_flat, cache):
@@ -714,7 +876,7 @@ class SlotSSMBlock(nn.Module):
         """
         B, K, D = slots.shape
         layer_idx = self.mamba.layer_idx
-        x = self.time_mixer_norm(slots).reshape(-1, 1, D)
+        x = self._slot_modulate(self.time_mixer_norm(slots)).reshape(-1, 1, D)
 
         has_prev = layer_idx in cache.key_value_memory_dict
         if not has_prev:
@@ -835,6 +997,36 @@ class SlotSSMBlock(nn.Module):
         #    drives activation, not just pre-existing slot state).
         informed = slots + cross_out
         gate_scores = self.gate(informed).squeeze(-1)                # [B, K]
+
+        # Optional third term: read the recurrent state the block wrote at the
+        # PREVIOUS step.  `has_prev` is False on the first step (no cache yet),
+        # so the term simply does not exist there -- the gate falls back to the
+        # instantaneous score, which is the only thing it could use anyway.
+        #
+        # This is read BEFORE any of this step's writes, so it is genuinely the
+        # state as of step t-1, and inactive slots contribute their (older)
+        # state unchanged -- which is the point: age is part of what it reads.
+        #
+        # DETACHED, and it has to be. The step-0 scan (Mamba2.forward with
+        # seqlen_offset=0) is differentiable and stores its output state in the
+        # cache, so on step 1 this tensor is still attached to step 0's graph --
+        # and after the training loop's per-step .backward() that graph is freed,
+        # so reading it differentiably raises "backward through the graph a
+        # second time". Every later step is written by the in-place step()
+        # kernels and carries no graph at all, so the attachment is a step-0
+        # artefact. Detaching also keeps the design honest: the readout is what
+        # learns, the state is an input. (This is NOT the fix for §3's missing
+        # temporal gradient -- that needs a differentiable pass over the whole
+        # sequence, not a gradient into one stale step.)
+        if self.state_gate is not None and has_prev:
+            ssm = cache.key_value_memory_dict[layer_idx][1].detach()
+            s = ssm.float().mean(dim=tuple(range(1, ssm.dim() - 1)))  # [B*K, d_state]
+            s = self.state_norm(s.view(B, K, -1))
+            assert s.shape[-1] == self.state_gate.shape[-1], (
+                f"ssm_state last dim {s.shape[-1]} != gate readout "
+                f"{self.state_gate.shape[-1]}")
+            gate_scores = gate_scores + (
+                s.to(gate_scores.dtype) @ self.state_gate.t()).squeeze(-1)
 
         # ``p`` is the differentiable gate distribution; the *selection* stays
         # hard top-k.  The gate is trained through two paths:
@@ -962,7 +1154,7 @@ class SlotSSMBlock(nn.Module):
             # STE mask: same forward value as `mask`, gradient flows to the gate.
             mask_3d = mask_ste.unsqueeze(-1)
             slots = slots + cross_out * mask_3d
-            x_all = self.time_mixer_norm(slots).reshape(-1, 1, D)
+            x_all = self._slot_modulate(self.time_mixer_norm(slots)).reshape(-1, 1, D)
             full_out = self.mamba(x_all, inference_params=cache).reshape(B, K, D)
             slots = slots + full_out * mask_3d
             slots = slots + self._self_attn_sparse(slots, active_flat)
@@ -991,7 +1183,8 @@ class SlotSSMBlock(nn.Module):
         compact_slots = prev_active + compact_cross
 
         # 5. Mamba on compact active slots
-        x_compact = self.time_mixer_norm(compact_slots).reshape(-1, 1, D)  # [B*tk, 1, D]
+        x_compact = self._slot_modulate(
+            self.time_mixer_norm(compact_slots), active_idx).reshape(-1, 1, D)
         idx_flat = active_idx.reshape(-1)                                   # [B*tk]
         kv = cache.key_value_memory_dict[layer_idx]
         conv_active = kv[0][idx_flat]       # [B*tk, C, d_conv] — integer idx → contiguous
@@ -1081,6 +1274,11 @@ class SlotSSMTemporalModel(nn.Module):
         gumbel_sigma: float = 0.0,
         logit_scale: float = 1.0,
         logit_scale_learnable: bool = False,
+        slot_input_gain: bool = False,
+        slot_input_proj_rank: int = 0,
+        slot_state_decay: bool = False,
+        gate_reads_state: bool = False,
+        gate_state_init: float = 0.0,
     ):
         super().__init__()
         _require_mamba()
@@ -1093,6 +1291,16 @@ class SlotSSMTemporalModel(nn.Module):
         # dense/sparse split, so it applies to both. See findings 15.9.
         self.logit_scale = float(logit_scale)
         self.logit_scale_learnable = bool(logit_scale_learnable)
+        # Per-slot differentiation flags (see SlotSSMBlock for the rationale).
+        # NOT gated on top_k: the recurrent state homogenises on the dense path
+        # too, so these apply to both.
+        self.slot_input_gain = bool(slot_input_gain)
+        self.slot_input_proj_rank = int(slot_input_proj_rank)
+        self.slot_state_decay = bool(slot_state_decay)
+        # Gate-reads-state is the ONE flag here that is sparse-only: it adds a
+        # term to a gate score, and dense has no gate. See SlotSSMBlock.
+        self.gate_reads_state = bool(gate_reads_state)
+        self.gate_state_init = float(gate_state_init)
 
         self.slots_init = nn.Parameter(torch.randn(1, num_slots, slot_dim) * 0.02)
 
@@ -1111,6 +1319,11 @@ class SlotSSMTemporalModel(nn.Module):
                 gumbel_sigma=gumbel_sigma if top_k is not None else 0.0,
                 logit_scale=logit_scale,
                 logit_scale_learnable=logit_scale_learnable,
+                slot_input_gain=slot_input_gain,
+                slot_input_proj_rank=slot_input_proj_rank,
+                slot_state_decay=slot_state_decay,
+                gate_reads_state=gate_reads_state,
+                gate_state_init=gate_state_init,
             )
             for i in range(num_blocks)
         ])
@@ -1205,6 +1418,21 @@ class SlotSSMTemporalModel(nn.Module):
         bal = 0.0
         for blk in self.blocks:
             slots = blk(slots, patches, cache)
+            if blk.slot_state_decay:
+                # Per-slot decay on the recurrent state, applied ONCE here rather
+                # than in each of the block's three Mamba call sites. The cache
+                # state is [B*K, H, hdim, d_state] with slots flattened as (b, k),
+                # so repeat the [K] decay B times to line up.
+                #
+                # Replaces the dict entry rather than mul_()ing in place: the
+                # first-step branch runs the differentiable scan, so the cached
+                # tensor may carry a graph and an in-place op on it would either
+                # error or silently corrupt it.
+                kv = cache.key_value_memory_dict.get(blk.mamba.layer_idx)
+                if kv is not None:
+                    d = blk.slot_decay().repeat(B).view(-1, 1, 1, 1)
+                    cache.key_value_memory_dict[blk.mamba.layer_idx] = (kv[0],
+                                                                       kv[1] * d)
             if blk.top_k is not None:
                 ent = ent + blk._gate_entropy
                 bal = bal + blk._gate_balance
@@ -1257,6 +1485,16 @@ class ClsVJEPA(nn.Module):
         # Learn one logit scale PER HEAD instead of fixing it, initialized to
         # logit_scale. Lets the model report where it wants to sit.
         logit_scale_learnable: bool = False,
+        # Per-slot differentiation (see SlotSSMBlock). Off by default so nothing
+        # existing changes.
+        slot_input_gain: bool = False,
+        slot_input_proj_rank: int = 0,
+        slot_state_decay: bool = False,
+        # Let the sparse gate score also read the previous step's SSM state.
+        # Sparse-only (dense has no gate). See SlotSSMBlock for the measurement
+        # that says this is worth doing only alongside `slot_input_proj_rank`.
+        gate_reads_state: bool = False,
+        gate_state_init: float = 0.0,
         train_encoder: bool = False,
         # V-JEPA spatial-grid mode (keep patch tokens, pool spatially like Swin)
         vjepa_spatial_grid: tuple | None = None,
@@ -1338,6 +1576,11 @@ class ClsVJEPA(nn.Module):
                 gumbel_sigma=gumbel_sigma if is_sparse else 0.0,
                 logit_scale=logit_scale,
                 logit_scale_learnable=logit_scale_learnable,
+                slot_input_gain=slot_input_gain,
+                slot_input_proj_rank=slot_input_proj_rank,
+                slot_state_decay=slot_state_decay,
+                gate_reads_state=gate_reads_state,
+                gate_state_init=gate_state_init,
             )
 
             # Learned attention-pool over slots (640 params — negligible).
@@ -1554,6 +1797,11 @@ class MultiHeadVJEPA(nn.Module):
                 use_inverted_attention=head_cfg.get("use_inverted_attention", False),
                 logit_scale=head_cfg.get("logit_scale", 1.0),
                 logit_scale_learnable=head_cfg.get("logit_scale_learnable", False),
+                slot_input_gain=head_cfg.get("slot_input_gain", False),
+                slot_input_proj_rank=head_cfg.get("slot_input_proj_rank", 0),
+                slot_state_decay=head_cfg.get("slot_state_decay", False),
+                gate_reads_state=head_cfg.get("gate_reads_state", False),
+                gate_state_init=head_cfg.get("gate_state_init", 0.0),
                 train_encoder=train_encoder,
                 vjepa_spatial_grid=head_cfg.get("vjepa_spatial_grid", None),
                 patch_size=head_cfg.get("patch_size", 16),
@@ -1632,6 +1880,11 @@ def build_cls_vjepa(cfg) -> ClsVJEPA:
         use_inverted_attention=cfg.get("use_inverted_attention", False),
         logit_scale=cfg.get("logit_scale", 1.0),
         logit_scale_learnable=cfg.get("logit_scale_learnable", False),
+        slot_input_gain=cfg.get("slot_input_gain", False),
+        slot_input_proj_rank=cfg.get("slot_input_proj_rank", 0),
+        slot_state_decay=cfg.get("slot_state_decay", False),
+        gate_reads_state=cfg.get("gate_reads_state", False),
+        gate_state_init=cfg.get("gate_state_init", 0.0),
         train_encoder=cfg.get("train_encoder", False),
         vjepa_spatial_grid=cfg.get("vjepa_spatial_grid", None),
         patch_size=cfg.get("patch_size", 16),

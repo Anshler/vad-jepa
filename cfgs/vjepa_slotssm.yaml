@@ -61,3 +61,6 @@ vertical_flip_prob: 0.0
 
 # --- Output ---------------------------------------------------------------
 output: ./output
+
+# --- per-slot differentiation: proj ---
+slot_input_proj_rank: 32
