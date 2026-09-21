@@ -190,6 +190,27 @@ def _weights_init(m):
         torch.nn.init.xavier_uniform_(m.weight, gain=1)
         if m.bias is not None:
             torch.nn.init.constant_(m.bias, 0)
+    if isinstance(m, nn.MultiheadAttention):
+            # in_proj_weight is a raw Parameter, not inside an nn.Linear, so the
+            # branch above never sees it and it keeps nn.MultiheadAttention's own
+            # xavier_uniform_. For the FUSED [3D, D] matrix that uses fan_out = 3D, so
+            # the bound is sqrt(6/(D+3D)) instead of the sqrt(6/(D+D)) a separate
+            # [D, D] Linear would get -- a factor sqrt(2) smaller per projection, and
+            # therefore 0.5 in the logit spread, since a logit is a product of two
+            # projections.
+            #
+            # Measured: logit_sd 0.489 here vs 0.983 for the reference repo's
+            # separate proj_q/proj_k Linears. That is the whole difference between
+            # this repo's cross-attention and the reference's, and it is an INIT
+            # difference only -- the two compute the same function on the same
+            # weights (tests/_check_mha_equiv.py, bit-identical).
+            #
+            # gain=sqrt(2) restores the scale the nn.Linear branch intends, so the
+            # fused parameter no longer silently gets a different effective gain.
+            # Biases are already zeroed by nn.MultiheadAttention._reset_parameters;
+            # repeated here so this branch fully owns the parameter.
+            torch.nn.init.xavier_uniform_(m.in_proj_weight, gain=math.sqrt(2))
+            torch.nn.init.constant_(m.in_proj_bias, 0)
     if isinstance(m, nn.LSTMCell):
         for param in m.parameters():
             if len(param.shape) >= 2:
