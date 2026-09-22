@@ -234,6 +234,17 @@ def _print_param_summary(encoder, temporal, classifier, extra_parts=None, spatia
 # ---------------------------------------------------------------------------
 # Weight initialisation
 # ---------------------------------------------------------------------------
+def _restore_rng(cpu_state, cuda_state=None):
+    """Rewind the global RNG to a snapshot.
+
+    Used to make the weight-init pass reproducible independently of how many
+    draws the construction phase happened to consume -- see ClsVJEPA.__init__.
+    """
+    torch.set_rng_state(cpu_state)
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
 def _weights_init(m):
     if isinstance(m, nn.Linear):
         torch.nn.init.xavier_uniform_(m.weight, gain=1)
@@ -1508,6 +1519,10 @@ class ClsVJEPA(nn.Module):
         self.temporal_type = temporal_model
         self.train_encoder = train_encoder
 
+        _init_rng = torch.get_rng_state()
+        _init_cuda_rng = (torch.cuda.get_rng_state_all()
+                          if torch.cuda.is_available() else None)
+
         # ---- Layout-agnostic setup ------------------------------------------
         self._is_swin = isinstance(encoder, SwinEncoder)
 
@@ -1600,6 +1615,7 @@ class ClsVJEPA(nn.Module):
                 nn.Dropout(dropout),
                 nn.Linear(dim_latent, 2),
             )
+            _restore_rng(_init_rng, _init_cuda_rng)
             self.apply(_weights_init)
             self.encoder = encoder   # attach AFTER weight init — preserves pretrained weights
 
@@ -1642,6 +1658,7 @@ class ClsVJEPA(nn.Module):
         else:
             raise ValueError(f"Unknown temporal_model: {temporal_model}")
 
+        _restore_rng(_init_rng, _init_cuda_rng)
         self.apply(_weights_init)
         self.encoder = encoder   # attach AFTER weight init — preserves pretrained weights
 
@@ -1767,11 +1784,50 @@ class MultiHeadVJEPA(nn.Module):
         self.heads = nn.ModuleDict()
         self.head_configs: dict[str, dict] = {}
 
+        # --- every head starts from the SAME init ---------------------------
+        # `set_deterministic(cfg.seed)` runs ONCE at the start of the run, and
+        # each `ClsVJEPA(...)` below draws from that same global RNG stream. So
+        # head 0 consumes draws 1..N1, head 1 consumes N1+1..N1+N2, and so on:
+        # the run is reproducible, but the heads within it are NOT identical
+        # (measured: `slots_init` up to 0.125 apart, tests/_head_init_check.py).
+        #
+        # That makes a multi-head run a fair EXPERIMENT but not a controlled
+        # ABLATION -- two arms would differ by the flag AND by a random weight
+        # draw, and that draw is worth ~0.02 AUC (findings 16.4), the same size
+        # as the effects being chased. It is what made the gate arms look
+        # significantly worse than their twins when a same-weights A/B showed
+        # the readout moves only 0.7-6% of routes.
+        #
+        # Saving the state before the loop and restoring it before each head
+        # gives every head draws 1..N, so all arms start identical.
+        #
+        # BLAST RADIUS -- read before re-deriving any run from its seed.
+        #
+        # This loop is the head-level half and is a no-op for a SINGLE head
+        # (restoring before the only head restores to where it already was).
+        # The other half is in ClsVJEPA.__init__, which rewinds the RNG before
+        # `self.apply(_weights_init)`; construction consumes draws, so that
+        # rewind changes the xavier values for EVERY model, single head
+        # included. Measured: the stock module's init logit_sd moved
+        # 0.971 -> 0.986 (tests/_check_init_fix.py).
+        #
+        # So: every run started after this change gets different weights than
+        # it would have before it, at the same seed. Existing checkpoints are
+        # unaffected -- init cannot touch a loaded model -- but a pre-change run
+        # cannot be re-derived from its seed, only from its checkpoint.
+        _rng = torch.get_rng_state()
+        _cuda_rng = (torch.cuda.get_rng_state_all()
+                     if torch.cuda.is_available() else None)
+
         for head_cfg in heads_configs:
             name = head_cfg["name"]
             if name in self.heads:
                 raise ValueError(f"Duplicate head name: {name}")
             self.head_configs[name] = dict(head_cfg)
+
+            torch.set_rng_state(_rng)
+            if _cuda_rng is not None:
+                torch.cuda.set_rng_state_all(_cuda_rng)
 
             self.heads[name] = ClsVJEPA(
                 encoder=encoder,
