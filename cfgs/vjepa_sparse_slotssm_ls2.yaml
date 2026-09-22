@@ -117,7 +117,11 @@ vertical_flip_prob: 0.0
 output: ./output
 
 # --- per-slot differentiation: proj ---
-slot_input_proj_rank: 32
+slot_input_proj_rank: 0    # OFF (2026-09-22): the proj arms measured
+                            # WORSE than no-proj at every scale tried
+                            # (findings 16.9.7 / 10.2), so proj-off is
+                            # the default now. The `_proj` variants set
+                            # 32 explicitly and are unaffected.
 
 # --- logit_scale sweep ---
 # forced off: see tests/_mk_logit_cfgs.py
