@@ -588,6 +588,45 @@ def _slot_sim(s):
     return off.sum(dim=(1, 2)) / (K * (K - 1))                 # [B]
 
 
+def _sincos_2d_pos_embed(n_tokens: int, dim: int, device, dtype):
+    """Fixed 2D sin/cos positional embedding for a grid of ``n_tokens`` cells.
+
+    Shape ``[1, n_tokens, dim]``. Same construction as the SlotSSM reference repo
+    (`src/models/encoder.py:get_2d_sincos_pos_embed`, itself HuggingFace's), and
+    as the ViTs it is copied from: the dimension is split into four equal
+    quarters holding sin(y), cos(y), sin(x), cos(x).
+
+    A SQUARE grid is assumed (``h = round(sqrt(n))``); a non-square token count
+    falls back to a 1 x n strip rather than raising, so an odd resolution cannot
+    crash a run. At the 6x6 = 36 grid this model uses, `dim=512 -> 4*128 = 512`
+    exactly, so no padding is ever needed here.
+
+    FIXED, not learned -- so it is a constant, not a parameter, and the flag adds
+    NO state-dict keys. That is deliberate: a learned table would be a bare
+    `nn.Parameter`, which `_weights_init` cannot see (the trap that caught
+    `in_proj_weight` in 15.9.1, `state_gate`, and the pooling `slot_query`), and
+    it would also make the mode checkpoint-incompatible for no benefit.
+    """
+    h = int(round(n_tokens ** 0.5))
+    if h * h == n_tokens:
+        gw = h
+    else:
+        h, gw = 1, n_tokens
+    d4 = max(dim // 4, 1)
+    omega = 1.0 / (10000 ** (torch.arange(d4, dtype=torch.float32,
+                                          device=device) / d4))
+    gy = torch.arange(h, dtype=torch.float32, device=device).repeat_interleave(gw)
+    gx = torch.arange(gw, dtype=torch.float32, device=device).repeat(h)
+    emb = torch.cat([torch.sin(gy[:, None] * omega),
+                     torch.cos(gy[:, None] * omega),
+                     torch.sin(gx[:, None] * omega),
+                     torch.cos(gx[:, None] * omega)], dim=1)
+    if emb.shape[1] < dim:                       # only if dim is not divisible by 4
+        emb = torch.cat([emb, torch.zeros(n_tokens, dim - emb.shape[1],
+                                          device=device)], dim=1)
+    return emb[:, :dim].unsqueeze(0).to(dtype)
+
+
 class SlotSSMBlock(nn.Module):
     """
     One SlotSSM block — matches the reference repo 1:1.
@@ -642,6 +681,12 @@ class SlotSSMBlock(nn.Module):
         gate_state_init: float = 0.0,
         slot_bias_gamma: float = 0.0,
         slot_bias_cap: float = 5.0,
+        # Add a FIXED 2D sin/cos positional embedding to the tokens the
+        # cross-attention reads, so slots can in principle key on WHERE a patch
+        # is rather than only on what it contains. Off by default: it changes the
+        # forward, so it is opt-in like every other flag here. Fixed rather than
+        # learned, so it adds no parameters and no state-dict keys.
+        slot_pos_pe: bool = False,
     ):
         super().__init__()
         _require_mamba()
@@ -879,6 +924,40 @@ class SlotSSMBlock(nn.Module):
         # diffs it against the real bfaa73a:model.py at one bf16 ULP.
         self.legacy_stale_kv = False
 
+        # --- Positional embedding on the cross-attention's KV tokens --------
+        # WHY THIS EXISTS (measured 2026-09-23): the slots do not use position at
+        # all. Re-running findings 6.7's centroid test on the trained scale sweep
+        # reproduced its baseline exactly (sparse scale 1 spread 0.060 cells on a
+        # 6x6 grid, inside 6.7's 0.04-0.07 band) and showed what sharpening does
+        # to it: the spread grows ~10x (0.06 -> 0.60 cells by scale 16) but every
+        # slot's temporal-mean centroid stays within 0.25 cells of the grid
+        # CENTRE, and the between-slot / within-slot ratio stays BELOW 1 at every
+        # scale (0.57-0.85) -- a slot's centroid drifts more over time than slots
+        # differ from each other. So the slots still carry no stable spatial
+        # identity, at any scale, in either architecture.
+        #
+        # The input has no position to use: `_spatial_pool_tokens` averages the
+        # NF frames and then applies a DEPTHWISE 4x4 conv, so output cell (i,j)
+        # depends only on input block (i,j) and nothing mixes across cells. Any
+        # position information in the pooled tokens is whatever survived the
+        # frozen encoder's own layernorm stack, implicitly.
+        #
+        # The reference repo gets position a different way and this is NOT how it
+        # does it: its ViT encoder adds fixed sincos embeddings before its
+        # transformer (`encoder.py:160`) and the slot model then reads those
+        # position-tagged tokens. This flag adds the embedding at the slot
+        # boundary instead, which is a DEVIATION from the reference -- worth
+        # stating in a write-up.
+        #
+        # Note what it can and cannot do at INIT: the 32 slots start from
+        # `slots_init`, which is per-slot distinct but highly similar (cos 0.85
+        # at dense scale 1), so an identical positional signal added to the keys
+        # makes every slot's attention pattern position-driven and therefore
+        # stable over time, but cannot by itself create BETWEEN-slot
+        # specialisation. That needs training to lock different slots onto
+        # different positions.
+        self.slot_pos_pe = bool(slot_pos_pe)
+        self._pe_cache: dict = {}
 
         # --- Diagnostics (populated during forward when _diag_enabled=True) ---
         self._diag_enabled = False
@@ -926,8 +1005,22 @@ class SlotSSMBlock(nn.Module):
     # Helpers
     # ------------------------------------------------------------------
 
+    def _pos_pe(self, x):
+        """Cached fixed sincos table for `x`'s token count, device and dtype."""
+        key = (x.shape[1], x.dtype, str(x.device))
+        pe = self._pe_cache.get(key)
+        if pe is None:
+            pe = _sincos_2d_pos_embed(x.shape[1], x.shape[-1], x.device, x.dtype)
+            self._pe_cache[key] = pe
+        return pe
+
     def _cross_attn(self, slots, ref_raw):
         ref_proj = self.input_proj(ref_raw)                       # [B, N, D]
+        # Optional FIXED positional embedding on the tokens the slots read, added
+        # in slot space just before the LayerNorm -- a constant per position, so
+        # it survives the norm as a direction change and adds no parameters.
+        if self.slot_pos_pe:
+            ref_proj = ref_proj + self._pos_pe(ref_proj)
         q = self.cross_attn_input_norm(slots)                     # [B, K, D]
         kv = self.cross_attn_ref_norm(ref_proj)                   # [B, N, D]
         if self._cross_attn_custom:
@@ -1417,6 +1510,9 @@ class SlotSSMTemporalModel(nn.Module):
         # Gradient-free per-slot logit bias for inverted attention; 0 = off.
         slot_bias_gamma: float = 0.0,
         slot_bias_cap: float = 5.0,
+        # Fixed 2D sincos positional embedding on the cross-attention's tokens.
+        # See SlotSSMBlock for why it exists and what it can/cannot do at init.
+        slot_pos_pe: bool = False,
     ):
         super().__init__()
         _require_mamba()
@@ -1464,6 +1560,7 @@ class SlotSSMTemporalModel(nn.Module):
                 gate_state_init=gate_state_init,
                 slot_bias_gamma=slot_bias_gamma,
                 slot_bias_cap=slot_bias_cap,
+                slot_pos_pe=slot_pos_pe,
             )
             for i in range(num_blocks)
         ])
@@ -1644,6 +1741,9 @@ class ClsVJEPA(nn.Module):
         # only; 0 = off. See MultiHeadAttention.
         slot_bias_gamma: float = 0.0,
         slot_bias_cap: float = 5.0,
+        # Fixed 2D sincos positional embedding on the cross-attention's tokens.
+        # Off by default; see SlotSSMBlock for the measurement behind it.
+        slot_pos_pe: bool = False,
         # --- Slot pooling: how the classifier reads the 32 slots -----------
         # 'dot'  (default) -- the historical behaviour, kept BIT-IDENTICAL: a
         #        bare `nn.Parameter` query, `softmax(slots . q / sqrt(D))`.
@@ -1751,6 +1851,7 @@ class ClsVJEPA(nn.Module):
                 gate_state_init=gate_state_init,
                 slot_bias_gamma=slot_bias_gamma,
                 slot_bias_cap=slot_bias_cap,
+                slot_pos_pe=slot_pos_pe,
             )
 
             # --- Slot pooling: how the classifier reads the 32 slots ---------
@@ -2117,6 +2218,7 @@ class MultiHeadVJEPA(nn.Module):
                 gate_state_init=head_cfg.get("gate_state_init", 0.0),
                 slot_bias_gamma=head_cfg.get("slot_bias_gamma", 0.0),
                 slot_bias_cap=head_cfg.get("slot_bias_cap", 5.0),
+                slot_pos_pe=head_cfg.get("slot_pos_pe", False),
                 slot_pool=head_cfg.get("slot_pool", "dot"),
                 slot_pool_hidden=head_cfg.get("slot_pool_hidden", 128),
                 slot_pool_gated=head_cfg.get("slot_pool_gated", True),
