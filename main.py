@@ -363,6 +363,37 @@ def train(cfg, model, traindata_loader, begin_epoch,
                 if isinstance(bal, torch.Tensor) and bal.item() > 0:
                     loss = loss + balance_weight * bal
 
+            # Inverted-attention slot usage.  Sharpening that softmax starves
+            # slots -- measured at init, the fraction of slots above 15% of fair
+            # share is 1.00 / 0.99 / 0.73 / 0.52 / 0.45 at logit_scale
+            # 1 / 2 / 4 / 8 / 16, with the worst slot at exactly 0.000 by scale
+            # 8 -- and training drives it to ~0.  Nothing else pushes back: the
+            # classifier pools over slots, so a dead slot is free, and there is
+            # no reconstruction objective to make it expensive.
+            #
+            # `_attn_usage` is the mean squared deviation of the per-frame slot
+            # mass from fair share, summed over blocks. 0 when the patches are
+            # spread evenly. Unlike `_balance` above (which acts on the GATE's
+            # routing) this acts on the patch-to-slot assignment itself.
+            # CLAMPED. The weight sits ~5x below the measured divergence
+            # threshold (the penalty alone is stable at lr 5e-05 and diverges at
+            # 5e-04), so normal operation never reaches the cap -- it is a safety
+            # net for a numerical spike, which is the one failure mode that would
+            # lose the whole run. Beyond the cap the gradient is zero, which is
+            # the right behaviour for a net that only engages in a regime you
+            # would otherwise lose the run in.
+            #
+            # Default cap 10.0 against a measured 2.3 at logit_scale 16, i.e.
+            # several times the initial value.
+            attn_usage_weight = head_cfgs[head_name].get("attn_usage_weight", 0.0)
+            attn_usage_cap = head_cfgs[head_name].get("attn_usage_cap", 10.0)
+            if attn_usage_weight > 0 and hasattr(head, "temporal") \
+                    and hasattr(head.temporal, "_attn_usage"):
+                use = head.temporal._attn_usage
+                if isinstance(use, torch.Tensor) and use.requires_grad:
+                    loss = loss + attn_usage_weight * torch.clamp(
+                        use, max=attn_usage_cap)
+
             if hasattr(head, "temporal") and hasattr(head.temporal, "_slot_mass_min"):
                 _mass_min = head.temporal._slot_mass_min
                 if not (isinstance(_mass_min, torch.Tensor) and torch.isnan(_mass_min)):
@@ -370,6 +401,12 @@ def train(cfg, model, traindata_loader, begin_epoch,
                     slot_diag["mass_mean"] = slot_diag.get("mass_mean", 0.0) + float(head.temporal._slot_mass_mean)
                     slot_diag["usage_frac"] = min(slot_diag.get("usage_frac", 999.0), float(head.temporal._slot_usage_frac))
                     slot_diag["_count"] = slot_diag.get("_count", 0) + 1
+                    # The penalty the loss is being charged, so it is watchable
+                    # alongside the diagnostic it is meant to reduce.
+                    _use = getattr(head.temporal, "_attn_usage", None)
+                    if isinstance(_use, torch.Tensor):
+                        slot_diag["usage_penalty"] = (slot_diag.get("usage_penalty", 0.0)
+                                                      + float(_use.detach()))
 
             # Accumulate the loss across clip-steps; backprop through time
             # (chunked BPTT) only at boundaries.
@@ -444,7 +481,16 @@ def train(cfg, model, traindata_loader, begin_epoch,
                         f"{name}/slots/mass_min": slot_diag["mass_min"],
                         f"{name}/slots/mass_mean": slot_diag["mass_mean"] / n,
                         f"{name}/slots/usage_frac": slot_diag["usage_frac"],
+                        f"{name}/slots/usage_penalty":
+                            slot_diag.get("usage_penalty", 0.0) / n,
                     }, step=e * 1000 + int(j * 1000 / n_batches))
+                    # Also to stdout, so a run is observable without wandb.
+                    # usage_frac is the MIN over blocks (worst block) and the
+                    # penalty is the SUM over blocks -- different aggregations,
+                    # so they need not move together.
+                    postfix_parts.append(
+                        f"uf:{slot_diag['usage_frac']:.3f}"
+                        f" pen:{slot_diag.get('usage_penalty', 0.0) / n:.2f}")
 
             pbar.set_postfix_str(" ".join(postfix_parts))
 

@@ -87,7 +87,8 @@ class MultiHeadAttention(nn.Module):
     def __init__(
         self, d_model, num_heads, dropout=0.0, inverted=False, bias=True,
         norm_over_input=True, epsilon=1e-5, logit_scale=1.0,
-        logit_scale_learnable=False,
+        logit_scale_learnable=False, num_slots=None, slot_bias_gamma=0.0,
+        slot_bias_cap=5.0,
     ):
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
@@ -140,6 +141,47 @@ class MultiHeadAttention(nn.Module):
         self._slot_mass_min = torch.tensor(float("nan"))
         self._slot_mass_mean = torch.tensor(float("nan"))
         self._slot_usage_frac = torch.tensor(float("nan"))
+        # DIFFERENTIABLE slot-usage penalty, inverted path only. 0 when the
+        # patch mass is spread evenly over the slots; grows as it concentrates.
+        # The caller weights it into the loss (config `attn_usage_weight`).
+        self._usage_penalty = torch.tensor(0.0)
+
+        # --- gradient-FREE slot-usage bias (inverted path only) --------------
+        # A per-slot additive bias on the LOGITS, nudged by observed usage and
+        # never differentiated. This is the mechanism that can actually work,
+        # and the gradient-based penalty above provably cannot.
+        #
+        # Measured, 48 videos / 10 epochs, scale-16 inverted, otherwise identical:
+        #
+        #     weight    usage_frac   live slots   penalty
+        #     0.0          0.031          1         3.51
+        #     0.2          0.062          2         2.90
+        #     2.0          0.031          1         3.16
+        #
+        # A 10x larger weight does NOTHING -- usage_frac is identical to the
+        # control and the penalty stays ~3 at every weight. The model cannot
+        # reduce the penalty at any price, because the softmax has SATURATED:
+        # once a slot's logits sit far below the max, d(softmax_s)/d(z_s) =
+        # exp(z_s - z_max) -> 0. The gradient that would lift a starved slot
+        # vanishes exactly when the slot is starved. So the term is not weak, it
+        # is unreachable.
+        #
+        # A bias needs no derivative: it shifts a starved slot's logits directly.
+        #
+        #   b_s += gamma * sign(1 - usage_s)      # usage relative to fair share
+        #
+        # detached, training-only (eval must be deterministic), clamped so it
+        # cannot run away. Updated from the same `mass_norm` the diagnostic uses.
+        # Note this acts on the patch-to-slot ASSIGNMENT, unlike the gate's
+        # `balance_weight`, which acts on routing.
+        self.slot_bias_gamma = float(slot_bias_gamma)
+        self.slot_bias_cap = float(slot_bias_cap)
+        if inverted and self.slot_bias_gamma > 0 and num_slots:
+            # A buffer, not a Parameter: never differentiated, and only created
+            # when enabled so existing checkpoints load unchanged.
+            self.register_buffer("slot_bias", torch.zeros(int(num_slots)))
+        else:
+            self.slot_bias = None
 
     def forward(self, q, k, v):
         B, T, _ = q.shape
@@ -154,6 +196,17 @@ class MultiHeadAttention(nn.Module):
         scale = (self.logit_scale_param.view(1, -1, 1, 1)
                  if self.logit_scale_param is not None else self.logit_scale)
         attn = torch.matmul(q_proj, k_proj.transpose(-1, -2)) * scale
+
+        # Gradient-free usage bias, inverted path only. Applied to the SLOT axis
+        # (dim 2) BEFORE the softmax, so it shifts which slot a patch prefers.
+        # Under standard attention the softmax runs over patches and a per-slot
+        # bias would be a constant within each row -- no effect -- so it is not
+        # applied there.
+        #
+        # Applied BEFORE `_last_logits` is recorded, so the diagnostic and the
+        # spread measurement both see the logits the softmax actually saw.
+        if self.inverted and self.slot_bias is not None:
+            attn = attn + self.slot_bias.view(1, 1, -1, 1)
 
         # Keep the pre-softmax logits (detached, diagnostic-only). The spread of
         # this tensor ACROSS TARGETS is what decides how selective the softmax
@@ -180,7 +233,63 @@ class MultiHeadAttention(nn.Module):
             self._slot_mass_mean = mass_norm.mean()                    # avg across slots
             # Fraction of slots receiving at least 15% of fair share
             self._slot_usage_frac = (mass_norm > 0.15).float().mean()
+
+            # --- gradient-free usage bias update -----------------------------
+            # Raised for under-used slots, lowered for over-used ones, by a fixed
+            # step. `mass_norm` is relative to fair share, so the target is 1.0.
+            #
+            # TRAINING ONLY. Eval must be deterministic, and the bias is state
+            # that should be frozen at whatever training settled on -- otherwise
+            # two eval passes over the same data would disagree.
+            #
+            # Averaged over the batch before the update: a per-slot step taken
+            # per batch item would be `batch_size` times larger and depend on the
+            # batch composition.
+            if self.slot_bias is not None and self.training:
+                with torch.no_grad():
+                    self.slot_bias.add_(
+                        self.slot_bias_gamma
+                        * torch.sign(1.0 - mass_norm.mean(dim=0)))
+                    self.slot_bias.clamp_(-self.slot_bias_cap,
+                                          self.slot_bias_cap)
             # -----------------------------------------------------------------
+            # DIFFERENTIABLE version of the same quantity, for the loss.
+            #
+            # Sharpening this softmax starves slots with no counter-pressure:
+            # measured at init, usage_frac is 1.00 / 0.99 / 0.73 / 0.52 / 0.45
+            # at logit_scale 1 / 2 / 4 / 8 / 16, and mass_min hits exactly 0.000
+            # by scale 8 -- at least one slot receives nothing. Training then
+            # drives usage_frac to ~0, which is the collapse.
+            #
+            # Nothing else pushes back: the classifier POOLS over slots, so a
+            # dead slot costs it nothing, and this repo has no reconstruction
+            # objective to make a dead slot expensive (which is how the
+            # reference repo survives the same sharpening).
+            #
+            # `mass_norm` sums to T across slots by construction (mean 1.0), so
+            # the squared deviation from 1 is the variance of the per-slot mass:
+            # 0 at an even spread, large when it concentrates. Per batch item,
+            # i.e. per frame -- the collapse that matters is within a frame,
+            # since that is what the pool reads.
+            # ONE-SIDED: charge only the DEFICIT, not the excess.
+            #
+            # A symmetric `(mass - 1)^2` is dominated by the over-used slots -- a
+            # slot at 3.0 contributes 4.0 while a starved slot at 0.0 contributes
+            # 1.0 -- so minimising it lowers the PEAK rather than lifting the
+            # FLOOR. Measured: descending it for 300 steps at the training lr cut
+            # the summed penalty 15.70 -> 9.33 while the worst block's
+            # `_slot_usage_frac` fell 0.44 -> 0.27, i.e. it made starvation
+            # worse while looking like it was working.
+            #
+            # Starvation is the floor, and it is what kills routing: a frame with
+            # two live slots has nothing for a top-16 gate to choose between. So
+            # only the deficit is charged, and a slot above fair share costs
+            # nothing -- concentrating attention is allowed, killing slots is not.
+            #
+            # 0 at an even spread; rises as slots fall below fair share.
+            live_mass = attn.sum(dim=(1, -1)) / fair                 # [B, T]
+            deficit = torch.clamp(1.0 - live_mass, min=0.0)
+            self._usage_penalty = (deficit ** 2).mean()
             if self.norm_over_input:
                 attn = attn / (attn.sum(dim=-1, keepdim=True) + self.epsilon)
         else:
@@ -531,6 +640,8 @@ class SlotSSMBlock(nn.Module):
         slot_state_decay: bool = False,
         gate_reads_state: bool = False,
         gate_state_init: float = 0.0,
+        slot_bias_gamma: float = 0.0,
+        slot_bias_cap: float = 5.0,
     ):
         super().__init__()
         _require_mamba()
@@ -568,6 +679,10 @@ class SlotSSMBlock(nn.Module):
                 d_model=slot_dim, num_heads=num_heads,
                 inverted=use_inverted_attention, logit_scale=logit_scale,
                 logit_scale_learnable=logit_scale_learnable,
+                # num_slots + the usage bias: a gradient-free per-slot logit
+                # bias, the only mechanism that can lift a saturated slot.
+                num_slots=num_slots, slot_bias_gamma=slot_bias_gamma,
+                slot_bias_cap=slot_bias_cap,
             )
             self._cross_attn_inverted = use_inverted_attention
         elif _HAS_FLASH_ATTN:
@@ -727,6 +842,10 @@ class SlotSSMBlock(nn.Module):
 
         self._gate_entropy = torch.tensor(0.0)  # accumulated per forward pass
         self._gate_balance = torch.tensor(0.0)  # load-balancing term (0 if disabled)
+        # Slot-usage penalty from the inverted cross-attention (0 unless the
+        # attention is inverted). Differentiable; weighted into the loss by the
+        # training loop via config `attn_usage_weight`.
+        self._attn_usage = torch.tensor(0.0)
 
         # --- DeepSeek-style aux-loss-free load balancing -------------------
         # A detached per-slot bias added to the gate scores before top-k, nudged
@@ -845,6 +964,11 @@ class SlotSSMBlock(nn.Module):
                                      cent.cpu() if cent is not None else None))
         else:
             out = self.cross_attn(q, kv, kv)[0]
+        # Slot-usage penalty, inverted path only. 0.0 otherwise, and the
+        # standard module has no `_usage_penalty` at all, hence the getattr.
+        # Consumed by the training loop via SlotSSMTemporalModel._attn_usage.
+        self._attn_usage = getattr(self.cross_attn, '_usage_penalty',
+                                   torch.tensor(0.0))
         return out
 
     def slot_decay(self):
@@ -1290,6 +1414,9 @@ class SlotSSMTemporalModel(nn.Module):
         slot_state_decay: bool = False,
         gate_reads_state: bool = False,
         gate_state_init: float = 0.0,
+        # Gradient-free per-slot logit bias for inverted attention; 0 = off.
+        slot_bias_gamma: float = 0.0,
+        slot_bias_cap: float = 5.0,
     ):
         super().__init__()
         _require_mamba()
@@ -1335,6 +1462,8 @@ class SlotSSMTemporalModel(nn.Module):
                 slot_state_decay=slot_state_decay,
                 gate_reads_state=gate_reads_state,
                 gate_state_init=gate_state_init,
+                slot_bias_gamma=slot_bias_gamma,
+                slot_bias_cap=slot_bias_cap,
             )
             for i in range(num_blocks)
         ])
@@ -1427,6 +1556,7 @@ class SlotSSMTemporalModel(nn.Module):
         slots = self.slots_init.expand(B, -1, -1)
         ent = 0.0
         bal = 0.0
+        usage = torch.tensor(0.0)
         for blk in self.blocks:
             slots = blk(slots, patches, cache)
             if blk.slot_state_decay:
@@ -1447,8 +1577,12 @@ class SlotSSMTemporalModel(nn.Module):
             if blk.top_k is not None:
                 ent = ent + blk._gate_entropy
                 bal = bal + blk._gate_balance
+            usage = usage + blk._attn_usage
         self._entropy = ent    # training loop reads this
         self._balance = bal    # load-balancing term (0 unless balance_weight > 0)
+        # Summed over blocks, matching `_balance`. 0 unless the attention is
+        # inverted. The training loop weights it by `attn_usage_weight`.
+        self._attn_usage = usage
 
         # Aggregate inverted cross-attn diagnostics across blocks (worst-case)
         self._slot_mass_min = min(blk._slot_mass_min for blk in self.blocks)
@@ -1506,6 +1640,25 @@ class ClsVJEPA(nn.Module):
         # that says this is worth doing only alongside `slot_input_proj_rank`.
         gate_reads_state: bool = False,
         gate_state_init: float = 0.0,
+        # Gradient-free per-slot logit bias for inverted attention. Inverted
+        # only; 0 = off. See MultiHeadAttention.
+        slot_bias_gamma: float = 0.0,
+        slot_bias_cap: float = 5.0,
+        # --- Slot pooling: how the classifier reads the 32 slots -----------
+        # 'dot'  (default) -- the historical behaviour, kept BIT-IDENTICAL: a
+        #        bare `nn.Parameter` query, `softmax(slots . q / sqrt(D))`.
+        # 'attn' -- LayerNorm the slots, then score them with attention pooling
+        #        (Ilse et al. 2018, ABMIL), gated or not by `slot_pool_gated`:
+        #            plain (Eq. 8): a_k ~ exp( w^T tanh(V h_k) )
+        #            gated (Eq. 9): a_k ~ exp( w^T ( tanh(V h_k) * sigmoid(U h_k) ) )
+        #        See the measurement at the construction site for why.
+        slot_pool: str = 'dot',
+        slot_pool_hidden: int = 128,
+        # Gating on top of 'attn': the two forms then differ by exactly one
+        # projection (U), which is what makes them a clean pair. Default True --
+        # gated is the form the literature recommends for the regime we measured
+        # (tanh near-linear on [-1, 1]) -- but a run should set it explicitly.
+        slot_pool_gated: bool = True,
         train_encoder: bool = False,
         # V-JEPA spatial-grid mode (keep patch tokens, pool spatially like Swin)
         vjepa_spatial_grid: tuple | None = None,
@@ -1596,14 +1749,106 @@ class ClsVJEPA(nn.Module):
                 slot_state_decay=slot_state_decay,
                 gate_reads_state=gate_reads_state,
                 gate_state_init=gate_state_init,
+                slot_bias_gamma=slot_bias_gamma,
+                slot_bias_cap=slot_bias_cap,
             )
 
-            # Learned attention-pool over slots (640 params — negligible).
-            # A learnable query attends to slots via dot-product, letting the
-            # classifier upweight anomaly-relevant slots instead of blending
-            # all 32 equally.  Then a post-temporal MLP mirroring the standard
-            # path's lin2 ensures both architectures have the same depth.
-            self.slot_query = nn.Parameter(torch.randn(1, 1, slot_dim) * 0.02)
+            # --- Slot pooling: how the classifier reads the 32 slots ---------
+            #
+            # `slot_pool = 'dot'` IS THE HISTORY AND IS BIT-IDENTICAL to the
+            # pre-change model. It is also a measured FAILURE, which is why
+            # `'attn'` exists:
+            #
+            #   The query set the softmax logit scale directly, because it was a
+            #   bare Parameter multiplied into the slots, with no projection and
+            #   no normalisation: logit = q.s/sqrt(D) with ||q|| = 0.02*sqrt(512)
+            #   = 0.4525 against a slot RMS of ~1.8, i.e. logits spanning about
+            #   +-0.04. A softmax over 32 slots with a 0.04 spread is uniform by
+            #   construction, and it measured uniform: `eff = exp(entropy)` came
+            #   out at 31.95-31.99 of a maximum of 32, with max weight 0.032-0.035
+            #   against the uniform 1/32 = 0.03125, in all ten arms of the
+            #   logit-scale sweep, both architectures, every scale. So the
+            #   classifier's input was an UNWEIGHTED MEAN of all 32 slots and the
+            #   "attention-pool" was an arithmetic mean.
+            #   It never recovered: ||slot_query|| after 50 epochs was 0.968-1.005x
+            #   its init value in every one of those arms, despite carrying
+            #   optimizer state. `_weights_init` cannot rescue it either -- that
+            #   function only visits nn.Modules, so a bare Parameter keeps
+            #   whatever it was handed. That is the same bug class as the fused
+            #   `in_proj_weight` of 15.9.1 (half the intended logit scale) and the
+            #   reason `state_gate` had to be designed around it: THIS IS THE
+            #   THIRD INSTANCE.
+            #
+            # `'attn'` is the STANDARD fix from the MIL literature, not an
+            # invention: attention pooling over a bag of instances, Ilse et al.
+            # 2018 (ABMIL, ICML). Both of its forms are available, differing by
+            # exactly one projection so they pair cleanly:
+            #
+            #     plain (Eq. 8):  a_k ~ exp( w^T tanh(V h_k) )
+            #     gated (Eq. 9):  a_k ~ exp( w^T ( tanh(V h_k) * sigmoid(U h_k) ) )
+            #
+            # Gated is the DEFAULT and the form the paper recommends for our
+            # regime, but the pair is meant to be run explicitly -- measured at
+            # init on a trained temporal model they are NOT equivalent, and the
+            # gated one is the FLATTER of the two (eff 28.5 vs 21.1 of 32), because
+            # sigmoid(U h) ~ 0.5 at init ATTENUATES the score rather than spreading
+            # it. `tests/_check_slot_pool.py` reports both.
+            #
+            # Two properties matter, and both are things 'dot' structurally lacked:
+            #
+            #  * The logit scale is set by the INIT SCHEME rather than by a
+            #    hand-picked constant, because the score goes through PROJECTIONS
+            #    (V, U, w are nn.Linear) instead of a raw dot product with a bare
+            #    vector. Xavier on those gives logits of order 1 -- measured
+            #    (tests/_check_slot_pool.py) at sd 0.95 against 'dot''s 0.038 --
+            #    which is the regime where the softmax actually selects.
+            #  * The LayerNorm makes the pool invariant to slot magnitude, which
+            #    under 'dot' drifted with `logit_scale` and left the pool's
+            #    effective temperature an uncontrolled function of the
+            #    cross-attention sharpening.
+            #
+            # GATED rather than the plain tanh form, for a reason the paper states
+            # and our own measurement independently lands on. Ilse et al. add the
+            # gate because "the tanh(.) non-linearity could be inefficient to
+            # learn complex relations", since "tanh(x) is approximately linear for
+            # x in [-1, 1]", which "could limit the final expressiveness"; the gate
+            # "introduces a learnable non-linearity that potentially removes the
+            # troublesome linearity in tanh(.)". Our pool logits measure at sd
+            # 0.95, so the pre-tanh activations sit INSIDE [-1, 1] -- tanh is in
+            # its near-linear region, which is exactly the inefficiency the gate
+            # exists to fix. So this is the cited answer to the regime we measured,
+            # and it is one mechanism rather than a choice needing an ablation.
+            #
+            # Deliberately NO temperature on the pooling softmax. Contrastive
+            # learning learns one (CLIP's logit_scale, the idiom this repo's
+            # `logit_scale` copies), but MIL pooling does not, and a tuned constant
+            # here would be a non-standard addition requiring its own ablation.
+            #
+            # NOTE: the modes have different parameter names, so checkpoints are
+            # NOT portable between them (documented, like `logit_scale_learnable`).
+            self.slot_pool = str(slot_pool)
+            self.slot_pool_hidden = int(slot_pool_hidden)
+            self._last_pool_attn = None      # the pool's weights, for diagnostics
+            if self.slot_pool == 'attn':
+                # Gated is a FLAG on 'attn', not a separate mode, so the plain
+                # and gated arms differ by exactly one projection (U) and nothing
+                # else -- which is what makes them a clean ablation pair.
+                #   plain: a_k ~ exp( w^T tanh(V h_k) )
+                #   gated: a_k ~ exp( w^T ( tanh(V h_k) * sigmoid(U h_k) ) )
+                self.slot_pool_norm = nn.LayerNorm(slot_dim)
+                self.slot_pool_V = nn.Linear(slot_dim, self.slot_pool_hidden)
+                self.slot_pool_w = nn.Linear(self.slot_pool_hidden, 1)
+                self.slot_pool_gated = bool(slot_pool_gated)
+                self.slot_pool_U = (nn.Linear(slot_dim, self.slot_pool_hidden)
+                                    if self.slot_pool_gated else None)
+                self.slot_query = None
+            elif self.slot_pool == 'dot':
+                self.slot_pool_gated = False
+                self.slot_pool_U = None
+                self.slot_query = nn.Parameter(torch.randn(1, 1, slot_dim) * 0.02)
+            else:
+                raise ValueError(
+                    f"slot_pool must be 'dot' or 'attn', got {slot_pool!r}")
             D = slot_dim
             self.classifier = nn.Sequential(
                 nn.LayerNorm(D),
@@ -1709,10 +1954,22 @@ class ClsVJEPA(nn.Module):
             if self._use_spatial_grid:
                 patches = self._spatial_pool_tokens(patches, self._vjepa_n_temp)
             slots, new_state = self.temporal(patches, state)  # [B, K, D]
-            # Learned attention-pool: query attends to slots
-            D = slots.shape[-1]
-            scores = (slots * self.slot_query).sum(dim=-1) / (D ** 0.5)  # [B, K]
+            # Learned attention-pool: query attends to slots. See __init__ for
+            # why 'dot' measures as an arithmetic mean and 'attn' is the fix.
+            if self.slot_pool == 'attn':
+                h = self.slot_pool_norm(slots)                    # [B, K, D]
+                # Attention pooling, Ilse et al. 2018: Eq. 8 plain, Eq. 9 gated.
+                g = torch.tanh(self.slot_pool_V(h))
+                if self.slot_pool_U is not None:
+                    g = g * torch.sigmoid(self.slot_pool_U(h))
+                scores = self.slot_pool_w(g).squeeze(-1)          # [B, K]
+            else:
+                D = slots.shape[-1]
+                scores = (slots * self.slot_query).sum(dim=-1) / (D ** 0.5)
             attn = scores.softmax(dim=-1)                       # [B, K]
+            # Kept for diagnostics, like MultiHeadAttention._last_attn: the pool
+            # weights are the only way to see WHICH slots reach the classifier.
+            self._last_pool_attn = attn.detach()
             pooled = (attn.unsqueeze(-1) * slots).sum(dim=1)   # [B, D]
             return self.classifier(pooled), new_state
 
@@ -1858,6 +2115,11 @@ class MultiHeadVJEPA(nn.Module):
                 slot_state_decay=head_cfg.get("slot_state_decay", False),
                 gate_reads_state=head_cfg.get("gate_reads_state", False),
                 gate_state_init=head_cfg.get("gate_state_init", 0.0),
+                slot_bias_gamma=head_cfg.get("slot_bias_gamma", 0.0),
+                slot_bias_cap=head_cfg.get("slot_bias_cap", 5.0),
+                slot_pool=head_cfg.get("slot_pool", "dot"),
+                slot_pool_hidden=head_cfg.get("slot_pool_hidden", 128),
+                slot_pool_gated=head_cfg.get("slot_pool_gated", True),
                 train_encoder=train_encoder,
                 vjepa_spatial_grid=head_cfg.get("vjepa_spatial_grid", None),
                 patch_size=head_cfg.get("patch_size", 16),
@@ -1941,6 +2203,8 @@ def build_cls_vjepa(cfg) -> ClsVJEPA:
         slot_state_decay=cfg.get("slot_state_decay", False),
         gate_reads_state=cfg.get("gate_reads_state", False),
         gate_state_init=cfg.get("gate_state_init", 0.0),
+        slot_bias_gamma=cfg.get("slot_bias_gamma", 0.0),
+        slot_bias_cap=cfg.get("slot_bias_cap", 5.0),
         train_encoder=cfg.get("train_encoder", False),
         vjepa_spatial_grid=cfg.get("vjepa_spatial_grid", None),
         patch_size=cfg.get("patch_size", 16),
