@@ -2049,25 +2049,34 @@ class ClsVJEPA(nn.Module):
         x = x.flatten(2).transpose(1, 2)                         # [B, grid_size, D]
         return x
 
+    def pool_scores(self, slots):
+        """Pooling LOGITS for these slots, in whichever `slot_pool` mode this head is.
+
+        ONE implementation, used by `forward` and by every diagnostic. The formula
+        was previously duplicated in `forward` and in two analysis scripts, and the
+        copies drifted: both scripts re-derived the `dot` form unconditionally, so
+        they crashed (`Tensor * None`) on an `attn` head, whose `slot_query` is None
+        by design. Call this, not the formula.
+        """
+        if self.slot_pool == 'attn':
+            h = self.slot_pool_norm(slots)                    # [B, K, D]
+            g = torch.tanh(self.slot_pool_V(h))
+            if self.slot_pool_U is not None:                  # gated, Ilse Eq. 9
+                g = g * torch.sigmoid(self.slot_pool_U(h))
+            return self.slot_pool_w(g).squeeze(-1)            # [B, K]
+        # 'dot' -- the historical form, bit-identical to the pre-change model.
+        D = slots.shape[-1]
+        return (slots * self.slot_query).sum(dim=-1) / (D ** 0.5)
+
     def forward(self, x, state=None):
         if self._slot_based:
             patches = self.encoder(x, return_patches=True)    # [B, N, embed_dim]
             if self._use_spatial_grid:
                 patches = self._spatial_pool_tokens(patches, self._vjepa_n_temp)
             slots, new_state = self.temporal(patches, state)  # [B, K, D]
-            # Learned attention-pool: query attends to slots. See __init__ for
-            # why 'dot' measures as an arithmetic mean and 'attn' is the fix.
-            if self.slot_pool == 'attn':
-                h = self.slot_pool_norm(slots)                    # [B, K, D]
-                # Attention pooling, Ilse et al. 2018: Eq. 8 plain, Eq. 9 gated.
-                g = torch.tanh(self.slot_pool_V(h))
-                if self.slot_pool_U is not None:
-                    g = g * torch.sigmoid(self.slot_pool_U(h))
-                scores = self.slot_pool_w(g).squeeze(-1)          # [B, K]
-            else:
-                D = slots.shape[-1]
-                scores = (slots * self.slot_query).sum(dim=-1) / (D ** 0.5)
-            attn = scores.softmax(dim=-1)                       # [B, K]
+            # Learned attention-pool over slots. See __init__ for why 'dot'
+            # measures as an arithmetic mean and 'attn' is the fix.
+            attn = self.pool_scores(slots).softmax(dim=-1)     # [B, K]
             # Kept for diagnostics, like MultiHeadAttention._last_attn: the pool
             # weights are the only way to see WHICH slots reach the classifier.
             self._last_pool_attn = attn.detach()

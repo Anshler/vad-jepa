@@ -98,6 +98,21 @@ output: ./output
 # --- per-slot differentiation: proj ---
 
 # --- scale x inverted sweep ---
+# --- slot pooling: gated attention (default from 2026-09-24) ---------------
+# Every `_ls*` config carries gated attention pooling (findings 23): the readout
+# was an arithmetic mean before (pool eff 31.95-31.99 of 32, findings 19.1), and
+# gating is the one readout change that beat the control on BOTH metrics,
+# replicated across two runs (+0.0064 f-AUC in attention-pool, +0.0090 f-AUC /
+# +0.0081 mvAUC in positional-encoding -- findings 19.4, 22.2).
+#
+# NOTE FOR THE PRE-2026-09-24 ARMS: `more-logit-scale`, `logit-scale` and
+# `init-fix` were trained with `dot`. Evaluating one of their checkpoints through
+# THIS config would build a gated pool whose parameters the checkpoint does not
+# contain, leaving the readout at its initialisation. Pass that run's own saved
+# cfg.yml, or set `slot_pool: dot` explicitly.
+slot_pool: attn
+slot_pool_hidden: 128
+slot_pool_gated: true
 logit_scale: 8
 use_inverted_attention: false
 slot_input_proj_rank: 0
