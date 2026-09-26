@@ -1968,8 +1968,25 @@ class ClsVJEPA(nn.Module):
             mode = "sparse" if is_sparse else "dense"
             if verbose:
                 sp = getattr(self, "vjepa_spatial_pool", None)
+                # The READOUT is a head-level attribute, so it is in neither the
+                # temporal nor the classifier count and it used to be omitted from
+                # this banner entirely. Invisible while the pool was 'dot' (512
+                # params), but 132K -- 0.7% -- once gated attention became the
+                # default, and this banner's number is the one a paper table
+                # quotes. Measured, cfgs/vjepa_sparse_slotssm.yaml: true trainable
+                # 18.618M against the 18.49M this printed before the fix.
+                if getattr(self, "slot_pool", "dot") == "attn":
+                    pool_mods = [m for m in (self.slot_pool_norm, self.slot_pool_V,
+                                             self.slot_pool_U, self.slot_pool_w)
+                                 if m is not None]
+                    parts = [("slot readout (attention pool)",
+                              nn.ModuleList(pool_mods))]
+                else:
+                    parts = [("slot readout (dot pool, historical)",
+                              nn.ParameterList([self.slot_query]))]
                 print(f"\n[ClsVJEPA] SlotSSM ({mode}) — Parameter summary:")
-                _print_param_summary(encoder, self.temporal, self.classifier, spatial_pool=sp)
+                _print_param_summary(encoder, self.temporal, self.classifier,
+                                     extra_parts=parts, spatial_pool=sp)
             return
 
         # ---- Standard path --------------------------------------------------
@@ -2316,6 +2333,18 @@ def build_cls_vjepa(cfg) -> ClsVJEPA:
         gate_state_init=cfg.get("gate_state_init", 0.0),
         slot_bias_gamma=cfg.get("slot_bias_gamma", 0.0),
         slot_bias_cap=cfg.get("slot_bias_cap", 5.0),
+        # The pool keys and slot_pos_pe MUST be here. `build_multi_head_vjepa`
+        # (the training path) has them; this single-head builder did not, so a
+        # config saying `slot_pool: attn` silently built the 'dot' pool here and
+        # a gated arm here and there were DIFFERENT MODELS from the same file.
+        # Latent until 2026-09-24, when gated attention became the base default
+        # (findings 23) and every `build_cls_vjepa` user started building dot
+        # while their config claimed gated. Two builders, one config: they have
+        # to agree.
+        slot_pool=cfg.get("slot_pool", "dot"),
+        slot_pool_hidden=cfg.get("slot_pool_hidden", 128),
+        slot_pool_gated=cfg.get("slot_pool_gated", True),
+        slot_pos_pe=cfg.get("slot_pos_pe", False),
         train_encoder=cfg.get("train_encoder", False),
         vjepa_spatial_grid=cfg.get("vjepa_spatial_grid", None),
         patch_size=cfg.get("patch_size", 16),

@@ -198,9 +198,14 @@ class ComponentTimer:
         if self._is_slot:
             with torch.no_grad(), self.ctx:
                 s.record()
-                D = slots_or_feats.shape[-1]
-                scores = (slots_or_feats * m.slot_query).sum(dim=-1) / (D ** 0.5)
-                attn = scores.softmax(dim=-1)
+                # `m.pool_scores` is the model's OWN readout, mode-aware: 'dot'
+                # (a bare query dot product) or 'attn' (V/U/w projections, gated
+                # per slot_pool_gated). The formula used to be spelled out here,
+                # which broke as soon as gated attention became the base default
+                # (2026-09-24): the config has no `slot_query`, so this raised.
+                # It also has to be the real readout for the TIMING to mean
+                # anything -- the gated form is three matmuls, not one.
+                attn = m.pool_scores(slots_or_feats).softmax(dim=-1)
                 pooled = (attn.unsqueeze(-1) * slots_or_feats).sum(dim=1)
                 logits = m.classifier(pooled)
                 e.record()

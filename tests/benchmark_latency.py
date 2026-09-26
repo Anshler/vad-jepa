@@ -89,6 +89,10 @@ def measure_latency(model, x, steps, amp_dtype=None):
 parser = argparse.ArgumentParser()
 parser.add_argument("--amp", default=_DEFAULT_AMP, choices=list(_AMP_CHOICES),
                     help=f"AMP dtype (default: {_DEFAULT_AMP})")
+parser.add_argument("--compile", action="store_true",
+                    help="Force torch.compile on. Every config in CONFIGS sets "
+                         "`compile: false`, so without this flag NOTHING here is "
+                         "compiled -- the banner used to claim otherwise.")
 parser.add_argument("--checkpoint", default=None,
                     help="Path to a pretrained V-JEPA checkpoint (.pt)")
 args = parser.parse_args()
@@ -99,7 +103,8 @@ mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
 amp_tag = f"AMP {args.amp}" if amp_dtype else "fp32"
 print(f"GPU: {gpu_name}  ({mem_gb:.1f} GB)")
 print(f"Target: <= {1000 / TARGET_FPS:.0f} ms/step for {TARGET_FPS} FPS online")
-print(f"ViT-B + torch.compile  |  {amp_tag}  |  WARMUP={WARMUP}  MEASURE={MEASURE}  Batch={B}\n")
+print(f"Compile: {'ON (forced)' if args.compile else 'off (configs set compile: false)'}"
+      f"  |  {amp_tag}  |  WARMUP={WARMUP}  MEASURE={MEASURE}  Batch={B}\n")
 
 print(f"{'Model':<22} {'Total':>8}  {'FPS':>7}  {'RT?':>5}")
 print(f"{'-'*22} {'-'*8}  {'-'*7}  {'-'*5}")
@@ -112,6 +117,8 @@ for name, tag in CONFIGS:
 
     cfg = load_cfg(name)
     cfg.model_name = "vit_base"
+    if args.compile:
+        cfg.compile = True
     if args.checkpoint is not None:
         cfg.checkpoint_path = args.checkpoint
     model = build_cls_vjepa(cfg)

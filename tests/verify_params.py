@@ -192,12 +192,31 @@ def breakdown_cls_vjepa(model: ClsVJEPA) -> dict:
 
     info["temporal"] = temporal_info
 
-    # ---- Slot query (SlotSSM only) ----
-    sq = getattr(model, "slot_query", None)
-    if sq is not None:
-        info["slot_query (learned attention-pool)"] = {
-            "trainable": count_param(sq),
-        }
+    # ---- The classifier's readout over the slots (SlotSSM only) ----
+    # MODE-AWARE, and it has to be: this block used to be `if slot_query is not
+    # None`, which SILENTLY omitted the readout entirely once gated attention
+    # became the default (slot_query is None in that mode) -- so a gated config's
+    # inventory showed no readout line at all and a total short by the pool's
+    # params (~132k), with the temporal and classifier sections covering neither.
+    if model._slot_based:
+        pool_info: OrderedDict = OrderedDict()
+        mode = getattr(model, "slot_pool", "dot")
+        if mode == "attn":
+            pool_info["slot_pool_norm (LayerNorm)"] = {
+                "trainable": _trainable(model.slot_pool_norm)}
+            pool_info["slot_pool_V"] = {"trainable": _trainable(model.slot_pool_V)}
+            if getattr(model, "slot_pool_U", None) is not None:
+                pool_info["slot_pool_U (gate)"] = {
+                    "trainable": _trainable(model.slot_pool_U)}
+            pool_info["slot_pool_w"] = {"trainable": _trainable(model.slot_pool_w)}
+            label = ("slot readout — gated attention (Ilse Eq. 9)"
+                     if model.slot_pool_gated
+                     else "slot readout — attention, ungated (Ilse Eq. 8)")
+        else:
+            pool_info["slot_query"] = {"trainable": count_param(model.slot_query)}
+            label = "slot query — mean pooling (historical)"
+        pool_info["_total"] = sum(v["trainable"] for v in pool_info.values())
+        info[label] = pool_info
 
     # ---- Classifier / projections ----
     if model._slot_based:
@@ -313,8 +332,13 @@ def print_breakdown(info: dict, indent: int = 0):
                     _print(indent + IND, f"├─ {sub}: {_fmt(subdata.get('trainable', 0))}")
             continue
 
-        if section == "slot_query (learned attention-pool)":
-            _print(indent, f"├─ {section}: {_fmt(data['trainable'])}")
+        if section.startswith("slot readout") or section.startswith("slot query"):
+            _print(indent, f"├─ {section}")
+            for comp, compdata in data.items():
+                if comp.startswith("_"):
+                    continue
+                _print(indent + IND, f"├─ {comp}: {_fmt(compdata['trainable'])}")
+            _print(indent + IND, f"└─ total: {_fmt(data.get('_total', 0))}")
             continue
 
         if section == "classifier":
