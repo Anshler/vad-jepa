@@ -30,7 +30,7 @@ Usage (WSL):
 
     python tests/diag_topk_mechanism.py \
         --config cfgs/vjepa_sparse_slotssm_topk_4.yaml \
-        --checkpoint output/vjepa_sparse_slotssm_topk_4_VCL_64_NF_4_finetuned/checkpoints/model-30.pt \
+        --checkpoint output/_supersede/vjepa_sparse_slotssm_topk_4_VCL_64_NF_4_finetuned/checkpoints/model-30.pt \
         --max_videos 60 --mode learned
 
     # then repeat with --mode random / roundrobin / frozen
@@ -213,8 +213,7 @@ def routing_stats(block_diags, top_k, num_slots, labels, toas, patch_delta,
     for t in range(T):
         for s in active[t].tolist():
             counts[s] += 1
-    usage = counts / max(T, 1)
-    # usage sums to top_k (each step activates top_k slots), so normalize before
+    usage = counts / max(T, 1)    # usage sums to top_k (each step activates top_k slots), so normalize before
     # taking an entropy — exp(H) is the *effective* slot count in [1, K].
     usage_p = usage / max(usage.sum(), 1e-12)
     eff_k = float(np.exp(_entropy(usage_p + 1e-12)))
@@ -229,7 +228,9 @@ def routing_stats(block_diags, top_k, num_slots, labels, toas, patch_delta,
 
     # --- 5. margin at the cutoff ------------------------------------------
     srt = np.sort(gate, axis=1)[:, ::-1]
-    margin = (srt[:, top_k - 1] - srt[:, top_k]) / (gate.std(axis=1) + 1e-9)
+    # top_k == K (dense) has no cutoff to measure: there is no (k+1)-th slot.
+    margin = ((srt[:, top_k - 1] - srt[:, top_k]) / (gate.std(axis=1) + 1e-9)
+              if top_k < K else np.full(T, np.nan))
 
     # --- 6. label association, per slot -----------------------------------
     # Reported as max AND mean over slots: the label information is
@@ -336,7 +337,8 @@ def routing_stats(block_diags, top_k, num_slots, labels, toas, patch_delta,
         S = np.asarray(sd[:T], dtype=np.float64)
         m = act_mask[:S.shape[0]]
         if m.any():
-            frozen_frac = float((S[~m] == 0).mean())
+            frozen_frac = (float((S[~m] == 0).mean()) if (~m).any()
+                           else float('nan'))       # dense: no inactive set
             act_delta = float(S[m].mean())
             if (~m).any():
                 inact_delta = float(S[~m].mean())
@@ -348,6 +350,113 @@ def routing_stats(block_diags, top_k, num_slots, labels, toas, patch_delta,
             tot = rm.sum(axis=1, keepdims=True) + 1e-12
             read_inactive_frac = float((rm * (~m)).sum() / tot.sum())
             read_gini = float(np.mean([_gini(rm[t]) for t in range(rm.shape[0])]))
+
+    # --- 8b. cross-slot state similarity (redundancy vs specialisation) ----
+    # High = slots are interchangeable; low = they have specialised.  The
+    # active/inactive split matters: inactive slots are frozen at their init,
+    # active ones are all pulled by the same cross-attn/Mamba input.
+    ss = block_diags.get('slot_sim') or []
+    sim_all = sim_act = sim_inact = float('nan')
+    sim_all_last = sim_act_last = sim_inact_last = float('nan')
+    sim_act_std = sim_all_std = float('nan')
+    if ss:
+        arr = np.asarray(ss[:T], dtype=np.float64)
+        sim_all = float(np.nanmean(arr[:, 0]))
+        sim_act = float(np.nanmean(arr[:, 1]))
+        sim_inact = float(np.nanmean(arr[:, 2]))
+        # Diag 3 in diag_sparse_gate.py reports only the LAST frame's active/
+        # inactive split, which is a single sample AND biased: at the end of a
+        # video most slots have been touched recently, so the "inactive" pool is
+        # dominated by recently-active slots.  Report both so the gap is visible.
+        sim_all_last = float(arr[-1, 0])
+        sim_act_last = float(arr[-1, 1])
+        sim_inact_last = float(arr[-1, 2])
+        sim_act_std = float(np.nanstd(arr[:, 1]))
+        sim_all_std = float(np.nanstd(arr[:, 0]))
+
+    # --- 8c. is long-dormant memory READ?  (tests persistent memory) ------
+    # age_k(t) = steps since slot k was last active.  If the frozen slots act as
+    # long-term memory, self-attn read mass should favour HIGH-age (dormant)
+    # slots.  corr ~ 0 or negative means the active set only reads what it (or
+    # its neighbours) just wrote, i.e. no long-range memory use.
+    read_age_corr = float('nan')
+    if self_d and len(self_d) == T:
+        rm = np.asarray([np.asarray(r).reshape(-1) for (_e, r) in self_d[:T]],
+                        dtype=np.float64)                       # [T, K]
+        age = np.full((T, K), np.nan)
+        last = np.full(K, -1)
+        for t in range(T):
+            seen = last >= 0
+            age[t, seen] = t - last[seen]
+            for sl in active[t].tolist():
+                last[sl] = t
+        m = np.isfinite(age) & np.isfinite(rm)
+        if m.sum() > 10 and rm[m].std() > 0 and age[m].std() > 0:
+            read_age_corr = float(np.corrcoef(rm[m], age[m])[0, 1])
+
+    # --- 8d. read mass BY AGE BUCKET (does DORMANT memory get read?) ------
+    # A global corr(read_mass, age) can read ~0 even if a small dormant
+    # population IS read, because low-age pairs dominate the mass.  Bucketing
+    # shows whether age>10 slots receive any read mass at all.
+    read_by_age = {}
+    read_share_gt10 = float('nan')
+    if self_d and len(self_d) == T:
+        rm2 = np.asarray([np.asarray(r).reshape(-1) for (_e, r) in self_d[:T]],
+                         dtype=np.float64)
+        age2 = np.full((T, K), np.nan)
+        last2 = np.full(K, -1)
+        for t in range(T):
+            seen = last2 >= 0
+            age2[t, seen] = t - last2[seen]
+            for sl in active[t].tolist():
+                last2[sl] = t
+        m2 = np.isfinite(age2) & np.isfinite(rm2)
+        tot = rm2[m2].sum()
+        for lo, hi in ((0, 0), (1, 1), (2, 5), (6, 10), (11, 30), (31, 10 ** 9)):
+            sel = m2 & (age2 >= lo) & (age2 <= hi)
+            if sel.sum() == 0:
+                continue
+            read_by_age[f"{lo}-{'inf' if hi > 10 ** 8 else hi}"] = dict(
+                n=int(sel.sum()),
+                share=float(rm2[sel].sum() / tot) if tot > 0 else float('nan'),
+                mean=float(rm2[sel].mean()))
+        sel10 = m2 & (age2 >= 11)
+        read_share_gt10 = float(rm2[sel10].sum() / tot) if tot > 0 else float('nan')
+
+    # --- 8e. are DORMANT slots TRIGGERED by relevant input? --------------
+    # Hypothesis: a dormant slot is a "backup" that stays quiet until the input
+    # contains something relevant.  That is a claim about ACTIVATION, not
+    # reading.  Prediction: activations of long-dormant slots are enriched on
+    # anomaly frames and coincide with larger input change (||d patch||).
+    trig = {}
+    if patch_delta is not None and len(patch_delta) >= T:
+        pdd = np.asarray(patch_delta[:T], dtype=np.float64)
+        lab = np.asarray(labels[:T], dtype=np.float64)
+        last = np.full(K, -1)
+        ages, anoms, pds = [], [], []
+        for t in range(T):
+            for sl in active[t].tolist():
+                if last[sl] >= 0:
+                    ages.append(t - last[sl]); anoms.append(lab[t]); pds.append(pdd[t])
+            for sl in active[t].tolist():
+                last[sl] = t
+        if len(ages) > 30:
+            ages = np.array(ages); anoms = np.array(anoms); pds = np.array(pds)
+            trig['_base'] = dict(n=int(ages.size), anom_rate=float(lab.mean()),
+                                 patch_delta=float(pdd.mean()))
+            for lo, hi, name in ((1, 2, 'recent_1_2'), (3, 10, 'mid_3_10'),
+                                 (11, 10 ** 9, 'dormant_gt10')):
+                m = (ages >= lo) & (ages <= hi)
+                if m.sum() < 10:
+                    continue
+                trig[name] = dict(n=int(m.sum()), anom_rate=float(anoms[m].mean()),
+                                  patch_delta=float(pds[m].mean()))
+
+    # per-slot update interval (the only source of a timescale hierarchy, since
+    # one Mamba module is shared by all slots -> identical intrinsic dynamics)
+    _u = usage[usage > 0]
+    slow_iv = float(1.0 / _u.min()) if _u.size else float('nan')
+    fast_iv = float(1.0 / _u.max()) if _u.size else float('nan')
 
     # --- 9. onset response (offset by NF: step t scores frame t+NF) --------
     onset_jac = base_jac = float('nan')
@@ -373,6 +482,15 @@ def routing_stats(block_diags, top_k, num_slots, labels, toas, patch_delta,
         chance_cv=float(chance_cv),
         usage_cv_ratio=float(usage_cv / chance_cv) if chance_cv > 0 else float('nan'),
         effective_k=eff_k, dead_slots=int((usage < 0.02).sum()),
+        # Per-slot usage and the dead-slot IDS, not just the count.  `dead_slots`
+        # is PER BLOCK -- each SlotSSMBlock owns its own gate and selects
+        # independently, so a slot dead in one block is routinely live in another.
+        # Saving the ids is what makes the cross-block question (same slot? ever
+        # written by ANY block?) answerable downstream; the count alone cannot
+        # distinguish "never selected" from "selected 50 times, scattered", since
+        # usage is aggregated over all T steps and has no temporal order.
+        usage_per_slot=[float(u) for u in usage],
+        dead_slot_ids=sorted(int(s) for s in np.nonzero(usage < 0.02)[0]),
         gate_entropy_mean=float(gate_ent.mean()),
         gate_entropy_uniform=float(np.log(num_slots)),
         gate_entropy_norm=float(gate_ent.mean() / np.log(num_slots)),
@@ -391,6 +509,13 @@ def routing_stats(block_diags, top_k, num_slots, labels, toas, patch_delta,
         frozen_update_frac=frozen_frac, active_delta=act_delta,
         inactive_delta=inact_delta,
         read_inactive_frac=read_inactive_frac, read_gini=read_gini,
+        slot_sim_all=sim_all, slot_sim_active=sim_act, slot_sim_inactive=sim_inact,
+        slot_sim_all_last=sim_all_last, slot_sim_active_last=sim_act_last,
+        slot_sim_inactive_last=sim_inact_last,
+        slot_sim_active_std=sim_act_std, slot_sim_all_std=sim_all_std,
+        read_age_corr=read_age_corr, slow_interval=slow_iv, fast_interval=fast_iv,
+        read_by_age=read_by_age, read_share_age_gt10=read_share_gt10,
+        trigger_by_age=trig,
         jaccard_at_onset=onset_jac, jaccard_baseline=base_jac,
     )
 
@@ -441,6 +566,42 @@ def main():
                          "video subset. Use it to measure the spread of "
                          "'random routing' AUC across draws.")
     ap.add_argument("--smooth", type=int, default=5)
+    ap.add_argument("--allow_dense", action="store_true",
+                    help="Also accept a DENSE SlotSSM checkpoint (temporal_model "
+                         "'slotssm'). Dense is the top_k = K degenerate case: no "
+                         "gate and no selection, so it is forced to 'learned' mode "
+                         "and the gate-based statistics are degenerate by "
+                         "construction. The gate-free statistics (slot_sim, read "
+                         "mass, read mass by age) are collected identically, which "
+                         "is the point -- it puts dense and sparse on one axis.")
+    ap.add_argument("--legacy_stale_kv", action="store_true",
+                    help="Run the sparse path under the PRE-FIX forward (bfaa73a): "
+                         "self-attn KV built from pre-update slot states. The "
+                         "frozen VCL=64 sparse checkpoint was trained AND "
+                         "evaluated under that forward, so this is the only way "
+                         "to score it under the code it was trained with. "
+                         "Without it, that checkpoint is a train/test forward "
+                         "mismatch and its AUC is comparable to nothing. Affects "
+                         "the sparse path only; the dense path is unchanged.")
+    ap.add_argument("--content", default="none",
+                    choices=["none", "breakpreserve", "scramble", "dense_ssm",
+                             "dense_both"],
+                    help="CONTENT intervention on the preserved rows, orthogonal to "
+                         "--mode (which changes SELECTION). 'breakpreserve' copies "
+                         "the freshly written active rows over the preserved ones: "
+                         "same sparsity, same selection, nothing preserved -- the "
+                         "causal test for 'the sparse advantage is preservation'. "
+                         "'scramble' permutes the stale content among the preserved "
+                         "rows: staleness and row count kept, slot-specific "
+                         "association destroyed, which separates 'preserved set is "
+                         "MEMORY' from 'preserved set is an un-overwritten BUFFER'. "
+                         "'dense_ssm' advances EVERY slot's per-slot Mamba state "
+                         "while the slot tensor still gets only top_k rows: the "
+                         "complement, dense-ifying the RECURRENT preservation. "
+                         "'dense_both' = dense_ssm + breakpreserve. "
+                         "Sparse only. Under the row-level modes the frozen audit "
+                         "(inactive_delta, frozen_update_frac) is expected to break "
+                         "BY CONSTRUCTION -- ignore it, it is the intervention.")
     ap.add_argument("--json_out", default=None)
     args = ap.parse_args()
 
@@ -464,13 +625,35 @@ def main():
     model, head, head_name = build_and_load(cfg, ckpt_path, DEVICE)
 
     if head.temporal_type != 'sparse_slotssm':
-        print(f"ERROR: temporal_model is {head.temporal_type!r}, expected 'sparse_slotssm'")
-        sys.exit(1)
+        # Dense SlotSSM is the top_k = K degenerate case.  It has no gate, so it
+        # is only ever run in 'learned' mode -- the routing interventions have no
+        # selection to override.  Everything that does not depend on the gate is
+        # still collected, which is what makes dense comparable to sparse here.
+        if head.temporal_type == 'slotssm' and args.allow_dense:
+            pass
+        else:
+            print(f"ERROR: temporal_model is {head.temporal_type!r}, expected "
+                  f"'sparse_slotssm' (or 'slotssm' with --allow_dense)")
+            sys.exit(1)
 
     temporal = head.temporal
-    top_k, num_slots = temporal.top_k, temporal.num_slots
+    is_dense = head.temporal_type == 'slotssm'
+    num_slots = temporal.num_slots
+    top_k = num_slots if is_dense else temporal.top_k
+    if is_dense:
+        args.mode = 'learned'
     grid = cfg.get('vjepa_spatial_grid', None)
-    print(f"  K={num_slots}  top_k={top_k}  blocks={len(temporal.blocks)}  grid={grid}")
+    print(f"  K={num_slots}  top_k={top_k}  blocks={len(temporal.blocks)}  grid={grid}"
+          + ("   [DENSE: no gate, all slots active]" if is_dense else ""))
+    if args.legacy_stale_kv:
+        if is_dense:
+            print("  legacy_stale_kv: no-op for dense (that path has no compact "
+                  "branch, so it is identical in both revisions)")
+        else:
+            for blk in temporal.blocks:
+                blk.legacy_stale_kv = True
+            print("  legacy_stale_kv: ON -- reproducing the pre-fix forward "
+                  "(stale self-attn KV)")
 
     # --- routing intervention ---
     if args.mode == 'knockout':
@@ -482,6 +665,23 @@ def main():
     else:
         fn = make_override(args.mode, top_k, num_slots, seed=args.route_seed)
     temporal.set_route_override(fn)
+
+    # --- content intervention (orthogonal to selection) ---
+    if args.content != 'none':
+        if is_dense:
+            print(f"  content={args.content}: NO-OP on dense (no preserved set). "
+                  f"Reporting it anyway so the mode is on the record.")
+        temporal.set_content_mode(args.content)
+        if args.content == 'dense_ssm':
+            print(f"  content=dense_ssm: EVERY slot's per-slot Mamba state is "
+                  f"advanced each step while the slot tensor still receives only "
+                  f"top_k rows. SELECTION untouched, and the ROW-level frozen "
+                  f"audit stays valid (rows really are frozen).")
+        else:
+            print(f"  content={args.content}: the preserved rows' CONTENT is being "
+                  f"altered while SELECTION is untouched. The frozen audit "
+                  f"(inactive_delta / frozen_update_frac) WILL break -- that is the "
+                  f"intervention, not a regression.")
 
     # --- data ---
     NF = cfg.get('NF', cfg.get('num_frames', 4))
@@ -516,7 +716,8 @@ def main():
                     else __import__('contextlib').nullcontext())
 
     # Collected per-frame, per-block
-    blocks = [dict(gate_scores=[], active_idx=[], cross=[], self_attn=[], slot_delta=[])
+    blocks = [dict(gate_scores=[], active_idx=[], cross=[], self_attn=[],
+                   slot_delta=[], slot_sim=[])
               for _ in range(len(temporal.blocks))]
     all_targets, all_outputs, all_toas, all_teas = [], [], [], []
     all_labels, all_patch_delta, all_seg_len = [], [], []
@@ -569,6 +770,16 @@ def main():
         nb = len(diag['gate_scores'])
         # AMP runs in bf16, and bf16 tensors have no numpy() — cast to fp32.
         for b in range(nb):
+            if is_dense:
+                # No gate, so synthesize the degenerate "every slot active"
+                # record, one row per forward step.  routing_stats then reports
+                # usage=uniform, eff_K=K, turnover=1, MI=0 -- all literally true
+                # for dense -- while the sections we actually care about
+                # (slot_sim, read mass, read mass by age) come from the real
+                # forward pass and are computed by identical code.
+                for _t in range(len(diag['slot_sim'][b])):
+                    blocks[b]['gate_scores'].append(np.zeros(num_slots))
+                    blocks[b]['active_idx'].append(np.arange(num_slots))
             for t in range(len(diag['gate_scores'][b])):
                 blocks[b]['gate_scores'].append(
                     diag['gate_scores'][b][t][0].float().numpy())
@@ -586,6 +797,10 @@ def main():
             for t in range(len(diag['slot_delta'][b])):
                 blocks[b]['slot_delta'].append(
                     diag['slot_delta'][b][t][0].float().numpy())
+            for t in range(len(diag.get('slot_sim', [[]])[b])):
+                a_, ac_, ia_ = diag['slot_sim'][b][t]
+                blocks[b]['slot_sim'].append(
+                    (a_[0].float().item(), ac_[0].float().item(), ia_[0].float().item()))
 
         all_targets.append(np.asarray(vid_targets))
         all_outputs.append(np.asarray(vid_outputs))
@@ -686,6 +901,112 @@ def main():
               f"active delta={st['active_delta']:.4f}  inactive delta={st['inactive_delta']:.4f}")
         print(f"    read mass     to-inactive frac={st['read_inactive_frac']:.4f}  "
               f"Gini={st['read_gini']:.4f}")
+        _tg = st.get('trigger_by_age') or {}
+        if _tg:
+            b = _tg.get('_base', {})
+            print(f"    TRIGGER by prior dormancy (base: anom_rate={b.get('anom_rate',float('nan')):.3f}, "
+                  f"|d patch|={b.get('patch_delta',float('nan')):.3f}, n={b.get('n')}):")
+            for k in ('recent_1_2', 'mid_3_10', 'dormant_gt10'):
+                if k in _tg:
+                    v = _tg[k]
+                    print(f"      {k:<14} n={v['n']:<7} anom_rate={v['anom_rate']:.3f}  "
+                          f"|d patch|={v['patch_delta']:.3f}")
+        _rba = st.get('read_by_age') or {}
+        print("    read mass by age: " + "  ".join(
+            f"{k}:share={v['share']:.4f}(n={v['n']})" for k, v in _rba.items()))
+        print(f"    read mass share to age>10 slots = {st['read_share_age_gt10']:.4f}")
+        print(f"    persistence   corr(read_mass, slot age)={st['read_age_corr']:+.4f}"
+              f"   update interval: slowest={st['slow_interval']:.1f} fastest={st['fast_interval']:.1f} steps")
+        print(f"    cos-sim MEAN over frames: all={st['slot_sim_all']:.4f} "
+              f"active={st['slot_sim_active']:.4f} inactive={st['slot_sim_inactive']:.4f}"
+              f"   (active sd={st['slot_sim_active_std']:.3f})")
+        print(f"    cos-sim LAST frame only: all={st['slot_sim_all_last']:.4f} "
+              f"active={st['slot_sim_active_last']:.4f} inactive={st['slot_sim_inactive_last']:.4f}"
+              f"   <- what diag_sparse_gate.py reports")
+        print(f"    slot cos-sim  all={st['slot_sim_all']:.4f}  "
+              f"active={st['slot_sim_active']:.4f}  "
+              f"inactive={st['slot_sim_inactive']:.4f}   "
+              f"(high = slots redundant)")
+
+    # ---- cross-block view of slot usage ---------------------------------
+    # `dead_slots` above is PER BLOCK.  Block is DEPTH, not time: the four
+    # blocks run in sequence inside every timestep, threading one slot tensor,
+    # and each owns its own gate.  So "dead in block 0" is a fact about one
+    # gate's working set, not about the model, and it does NOT mean the slot
+    # was later revived -- usage is aggregated over all T steps and carries no
+    # temporal order at all.
+    #
+    # What the threading DOES make meaningful is the union: a slot is written
+    # in step t if ANY block selected it, so the per-slot update rate at the
+    # model level is the OR over blocks, which is >= every block's own rate.
+    # Block-level "dead" therefore overstates deadness at the model level.
+    xblock = {}
+    _live = [st for st in (stats.get(f'block{b}') for b in range(len(blocks)))
+             if st and st.get('usage_per_slot') is not None]
+    if len(_live) > 1:
+        U = np.asarray([st['usage_per_slot'] for st in _live], dtype=np.float64)
+        dead_sets = [set(st['dead_slot_ids']) for st in _live]
+        # --- EXACT model-level write rate --------------------------------
+        # Per-step OR over blocks, from the per-step active sets.  This is the
+        # quantity the question actually asks ("was slot k written this step"),
+        # and it is NOT max(usage_b): max over AGGREGATES is only a LOWER bound
+        # on it, tight only when one block's selections contain the others'.
+        # Cheap: T * n_blocks * top_k index updates (~640k at T=9964).
+        _A = [blocks[b]['active_idx'] for b in range(len(blocks))]
+        _Tb = min(len(a) for a in _A)
+        _or = np.zeros(num_slots)
+        for t in range(_Tb):
+            seen = set()
+            for a in _A:
+                seen.update(np.asarray(a[t]).reshape(-1).tolist())
+            for k in seen:
+                _or[int(k)] += 1
+        or_rate = _or / max(_Tb, 1)
+        any_usage = U.max(axis=0)          # LOWER bound on the true rate
+        union = sorted(set().union(*dead_sets)) if dead_sets else []
+        inter = sorted(set.intersection(*dead_sets)) if dead_sets else []
+        xblock = dict(
+            n_blocks=len(_live),
+            dead_ids_per_block=[sorted(s) for s in dead_sets],
+            dead_union_ids=union,
+            dead_intersection_ids=inter,
+            n_dead_pairs=len(sum([st['dead_slot_ids'] for st in _live], [])),
+            any_block_usage_min=float(any_usage.min()),
+            any_block_usage_mean=float(any_usage.mean()),
+            dead_any_block=int((any_usage < 0.02).sum()),
+            dead_every_block=int((U < 0.02).all(axis=0).sum()),
+            effective_k_any_block=float(np.exp(_entropy(
+                (any_usage / max(any_usage.sum(), 1e-12)) + 1e-12))),
+            # the exact version of the two numbers above
+            or_steps=int(_Tb),
+            or_rate_min=float(or_rate.min()),
+            or_rate_mean=float(or_rate.mean()),
+            dead_or=int((or_rate < 0.02).sum()),
+            effective_k_or=float(np.exp(_entropy(
+                (or_rate / max(or_rate.sum(), 1e-12)) + 1e-12))),
+            or_usage_per_slot=[float(u) for u in or_rate],
+            eff_k_per_block=[float(st['effective_k']) for st in _live],
+            dead_per_block=[int(st['dead_slots']) for st in _live],
+        )
+        print("\n" + "-" * 84)
+        print("CROSS-BLOCK SLOT USAGE  (block = depth, not time)")
+        print("-" * 84)
+        print(f"  dead per block        : {xblock['dead_per_block']}")
+        print(f"  eff_K per block       : "
+              + "  ".join(f"{v:.2f}" for v in xblock['eff_k_per_block']))
+        print(f"  dead ids per block    : {xblock['dead_ids_per_block']}")
+        print(f"  union of dead ids     : {union}  ({len(union)} distinct)")
+        print(f"  in EVERY block's dead : {inter}")
+        print(f"  written by SOME block : min usage over slots = "
+              f"{xblock['any_block_usage_min']:.4f} (max-of-aggregates LOWER bound), "
+              f"dead(<0.02) at model level = {int(xblock['dead_any_block'])}")
+        print(f"  EXACT per-step OR     : min rate over slots = "
+              f"{xblock['or_rate_min']:.4f}  mean = {xblock['or_rate_mean']:.4f}  "
+              f"dead(<0.02) = {int(xblock['dead_or'])}")
+        print(f"  eff_K at model level  : {xblock['effective_k_or']:.2f} (exact OR)"
+              f"   {xblock['effective_k_any_block']:.2f} (lower bound)"
+              f"   vs {min(xblock['eff_k_per_block']):.2f}-"
+              f"{max(xblock['eff_k_per_block']):.2f} per block")
 
     # ---- JSON ----
     payload = dict(
@@ -703,6 +1024,11 @@ def main():
         latency_ms_mean=float(np.mean(frame_times)),
         latency_ms_p90=float(np.percentile(frame_times, 90)),
         event=em, routing=stats,
+        # Cross-block slot-usage view (per-block dead ids, the union, and the
+        # exact per-step OR write rate).  Printed as well, but it belongs in the
+        # json: it is the only model-level usage statistic here, and everything
+        # under `routing` is PER BLOCK.
+        xblock=xblock,
     )
     out_path = args.json_out or os.path.join(
         _REPO_ROOT, 'output',
