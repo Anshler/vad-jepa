@@ -1,0 +1,79 @@
+# RECOVERED from output/vcl-64/vjepa_sparse_slotssm_VCL_64_NF_4_finetuned/cfg.yml by tests/_mk_vcl64_cfgs.py.
+# The run was launched from a Colab-side config that is not in cfgs/, so this file
+# is the head block the run itself saved -- the authoritative record.
+# `checkpoint_path` is the only edit (repointed at the local encoder copy).
+# Verify by loading the checkpoint: missing=0 unexpected=0.
+FPS: 10
+NF: 4
+VCL: 64
+_head_names:
+- vjepa_sparse_slotssm_VCL_64_NF_4_finetuned
+amp_dtype: bf16
+balance_weight: 0.0
+batch_size: 32
+checkpoint_key: ema_encoder
+checkpoint_path: /home/chrysenberg/vjepa2-checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
+class_weights:
+- 0.3
+- 0.7
+compile: false
+config:
+- cfgs/vjepa_sparse_slotssm.yaml
+data_mean:
+- 0.5
+- 0.5
+- 0.5
+data_path: /content/DoTA_dataset
+data_std:
+- 0.5
+- 0.5
+- 0.5
+dataset: Dota
+dim_latent: 1024
+dropout: 0.3
+enable_validation: true
+epoch: -1
+epochs: 30
+eps_random: 0.05
+gumbel_sigma: 0.0
+horizontal_flip_prob: 0.5
+image_shape:
+- 720
+- 1280
+img_size: 384
+input_shape:
+- 384
+- 384
+lr: 5.0e-05
+mamba_d_conv: 4
+mamba_d_state: 128
+mamba_expand: 2
+mamba_version: mamba2
+model_name: vit_base
+num_frames: 4
+num_slots: 32
+num_ssm_blocks: 4
+num_workers: 4
+output: /content/gdrive/MyDrive/vjepa_movad_project/output
+patch_size: 16
+phase: train
+recency_lambda: 0.0
+recency_rho: 0.9
+seed: 123
+slot_dim: 512
+slot_input_proj_rank: 0
+slot_pool: attn
+slot_pool_gated: true
+slot_pool_hidden: 128
+snapshot_interval: 2
+temporal_model: sparse_slotssm
+top_k: 16
+train_encoder: true
+tubelet_size: 2
+use_inverted_attention: false
+val_batch_size: 16
+validation_epoch_step: 10
+vertical_flip_prob: 0.0
+vjepa_spatial_grid:
+- 6
+- 6

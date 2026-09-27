@@ -971,6 +971,13 @@ class SlotSSMBlock(nn.Module):
         # routing interventions (random / round-robin / frozen).  None = learned
         # top-k, i.e. exactly the production path.
         self._route_override = None
+        # CONTENT intervention on the preserved (inactive) rows: None (production),
+        # 'breakpreserve', or 'scramble'.  Distinct from _route_override, which
+        # changes WHICH slots are selected; this changes only what the unselected
+        # rows hold, so selection statistics stay valid under it.  See the block
+        # comment in the sparse forward for the memory-vs-buffer logic.
+        self._content_mode = None
+        self._scramble_perm = None
         # Spatial grid (rows, cols) of the patch tokens, for attention centroids.
         self._diag_grid = None
 
@@ -1415,12 +1422,36 @@ class SlotSSMBlock(nn.Module):
             self.time_mixer_norm(compact_slots), active_idx).reshape(-1, 1, D)
         idx_flat = active_idx.reshape(-1)                                   # [B*tk]
         kv = cache.key_value_memory_dict[layer_idx]
-        conv_active = kv[0][idx_flat]       # [B*tk, C, d_conv] — integer idx → contiguous
-        ssm_active = kv[1][idx_flat]        # [B*tk, H, hdim, d_state]
-        out_active, _, _ = self.mamba.step(x_compact, conv_active, ssm_active)
-        kv[0][idx_flat] = conv_active       # scatter updated states back
-        kv[1][idx_flat] = ssm_active
-        compact_slots = compact_slots + out_active.squeeze(1).reshape(B, tk, D)
+        if self._content_mode in ('dense_ssm', 'dense_both'):
+            # DENSE-IFY THE RECURRENT PRESERVATION: advance EVERY slot's per-slot
+            # Mamba state (conv + ssm) this step, while the slot TENSOR still
+            # receives only the top_k rows.  The exact complement of
+            # 'breakpreserve', which dense-ifies the tensor and leaves the
+            # recurrence.  Together the two cover both things sparse preserves.
+            #
+            # This REPLACES the compact step rather than adding to it: running
+            # both would advance the active slots' state twice in one timestep.
+            #
+            # Input is `slots + cross_out` (the pre-write slots plus the
+            # cross-attn output computed for all K), which is exactly the dense
+            # path's pre-Mamba state; on the active rows it equals `compact_slots`.
+            #
+            # `step()` mutates conv_state/ssm_state IN PLACE (copy_ / the in-place
+            # causal-conv and selective-scan kernels), so passing kv[0]/kv[1]
+            # directly is the write-back -- unlike the compact branch, which must
+            # scatter because it indexed out a copy.
+            x_all = self._slot_modulate(
+                self.time_mixer_norm(slots + cross_out)).reshape(-1, 1, D)
+            out_all, _, _ = self.mamba.step(x_all, kv[0], kv[1])
+            out_active = out_all.reshape(B, K, D)[batch_idx, active_idx]
+        else:
+            conv_active = kv[0][idx_flat]       # [B*tk, C, d_conv]
+            ssm_active = kv[1][idx_flat]        # [B*tk, H, hdim, d_state]
+            out_active, _, _ = self.mamba.step(x_compact, conv_active, ssm_active)
+            kv[0][idx_flat] = conv_active       # scatter updated states back
+            kv[1][idx_flat] = ssm_active
+            out_active = out_active.squeeze(1).reshape(B, tk, D)
+        compact_slots = compact_slots + out_active
 
         # 6. Write the compact update back BEFORE self-attn, so the KV reflects
         #    post-update slots exactly as the dense path does.  Inactive slots
@@ -1469,6 +1500,62 @@ class SlotSSMBlock(nn.Module):
         slots = torch.index_put(
             slots, (batch_idx, active_idx),
             prev_active + (compact_slots - prev_active) * w_ste)
+
+        # --- CONTENT interventions on the PRESERVED set (diagnostics only) ---
+        # These leave SELECTION completely untouched -- the same top_k slots are
+        # written, the same K-top_k are preserved, every step.  Only what the
+        # preserved rows CONTAIN changes.  They exist because dense-vs-sparse
+        # cannot separate the two candidate explanations for the sparse
+        # advantage: "the preserved set is MEMORY" (it retains history the
+        # readout uses) and "the preserved set is an UN-OVERWRITTEN BUFFER"
+        # (a variance/regularisation effect that would work about as well if the
+        # content were arbitrary) BOTH predict that dense, which overwrites,
+        # does worse.  They come apart on whether the content matters:
+        #
+        #   breakpreserve -- copy the freshly-written ACTIVE rows over the
+        #     inactive ones.  Same sparsity, same selection, nothing preserved:
+        #     the causal test.  If preservation is the mechanism, this gives the
+        #     sparse advantage back (AUC should fall toward dense's).
+        #   scramble -- permute the STALE content among the preserved rows with a
+        #     permutation fixed for the run.  Staleness and row count are both
+        #     preserved; slot-specific association is destroyed.  Content-
+        #     agnostic accounts keep the gain; a slot-specific memory account
+        #     loses it.
+        #   dense_ssm / dense_both -- NOT here; those act on the per-slot Mamba
+        #     state (see the compact Mamba step above).  dense_ssm leaves the rows
+        #     alone entirely, so it is excluded from this block rather than
+        #     silently treated as a no-op.
+        #
+        # NOTE: under the ROW-level modes `_diag_slot_delta` on inactive rows is no
+        # longer 0 and `frozen_update_frac` falls below 1.0 BY CONSTRUCTION.
+        # Those two diagnostics are the audit for the untouched forward; under an
+        # intervention they must be ignored, not read as a broken invariant.
+        # `dense_ssm` does not disturb them -- the rows really are frozen there,
+        # which is the point of the mode.
+        if self._content_mode in ('breakpreserve', 'scramble', 'dense_both'):
+            m = hard.bool()                                    # [B, K] written this step
+            n_in = K - tk
+            if n_in > 0:
+                # Inactive ids per row, ascending: [B, n_in].  Descending sort puts
+                # the tk WRITTEN ids first, so the preserved set is [:, tk:].
+                # stable=True so the id order does not depend on tie-breaking.
+                iact = torch.argsort(m.int(), dim=1, descending=True,
+                                     stable=True)[:, tk:]
+                if self._content_mode in ('breakpreserve', 'dense_both'):
+                    # Cycle through the active rows when n_in > tk (top_k=4 leaves
+                    # 28 preserved, so a 1:1 copy is not available).
+                    act_ids = active_idx[:, torch.arange(n_in, device=slots.device) % tk]
+                    src = slots[batch_idx, act_ids]
+                elif self._content_mode == 'scramble':
+                    if self._scramble_perm is None:
+                        g = torch.Generator(device=slots.device).manual_seed(0)
+                        self._scramble_perm = torch.randperm(
+                            n_in, generator=g, device=slots.device)
+                    src = slots[batch_idx, iact][:, self._scramble_perm]
+                else:
+                    raise ValueError(f'unknown content_mode {self._content_mode!r}')
+                slots = torch.index_put(slots, (batch_idx, iact), src)
+
         if self._diag_enabled:
             # Per-slot L2 movement this step.  Inactive slots must read exactly
             # 0 for the frozen-memory claim to hold.
@@ -1615,6 +1702,34 @@ class SlotSSMTemporalModel(nn.Module):
         """
         for blk in self.blocks:
             blk._route_override = fn
+
+    def set_content_mode(self, mode):
+        """Install a CONTENT intervention on the preserved rows of every block.
+
+        ``None`` restores the production forward.  ``'breakpreserve'`` copies the
+        freshly written active rows over the preserved ones; ``'scramble'``
+        permutes the stale content among the preserved rows.  Both leave the
+        SELECTION (and therefore every routing statistic) untouched, so this is
+        orthogonal to ``set_route_override`` and the two can be combined.
+
+        ``'dense_ssm'`` is a different axis -- it advances EVERY slot's per-slot
+        Mamba state while the slot tensor still receives only the top_k rows, i.e.
+        it dense-ifies the RECURRENT preservation.  ``'dense_both'`` does that and
+        ``'breakpreserve'`` together, which is the closest thing to the dense
+        forward reachable without retraining.
+
+        Sparse only: the dense path has no preserved set, so on a dense model the
+        row-level modes are no-ops (and the caller should say so rather than imply
+        they were applied).
+        """
+        if mode not in (None, 'breakpreserve', 'scramble', 'dense_ssm',
+                        'dense_both'):
+            raise ValueError(f'content_mode must be None, breakpreserve, '
+                             f'scramble, dense_ssm or dense_both, got {mode!r}')
+        self._content_mode = mode
+        for blk in self.blocks:
+            blk._content_mode = mode
+            blk._scramble_perm = None     # regenerate for the new run
 
     def get_diagnostics(self) -> dict:
         """Return collected diagnostics after a forward pass.
