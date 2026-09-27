@@ -694,7 +694,11 @@ def main():
     limit = min(args.max_videos if args.max_videos > 0 else total, total)
     rng = np.random.RandomState(args.seed)
     indices = rng.permutation(total)[:limit].tolist()
-    print(f"\nTest videos: {limit}/{total}  (shuffled, seed={args.seed})")
+    print(f"\nTest videos: {limit}/{total}  (shuffled, seed={args.seed})",
+          flush=True)
+    # Wall clock for the progress line's elapsed/ETA.  Set BEFORE the loop: the
+    # progress print is inside it and references this.
+    _t_start = time.perf_counter()
 
     model.eval()
     head.eval()
@@ -818,9 +822,20 @@ def main():
             all_patch_delta.extend(
                 np.linalg.norm(np.diff(pm, axis=0), axis=1).tolist())
 
-        if (vi + 1) % 10 == 0:
+        # Progress with elapsed + ETA, and FLUSHED.  Stdout is fully buffered
+        # when redirected to a file (the normal way to run a multi-hour sweep),
+        # so an unflushed print here reaches the log only after ~8 KB has
+        # accumulated -- which is a thousand videos, i.e. the log looks EMPTY for
+        # most of the run and the job looks hung.  flush=True is the fix; `python
+        # -u` also works but has to be remembered at every call site.
+        if (vi + 1) % 5 == 0 or vi == 0:
+            _done = time.perf_counter() - _t_start
+            _per = _done / max(vi + 1, 1)
+            _left = _per * (limit - vi - 1)
             print(f"  [{vi + 1}/{limit}] frames={n_frames} "
-                  f"({np.mean(frame_times):.0f} ms/frame)")
+                  f"({np.mean(frame_times):.0f} ms/frame)  "
+                  f"elapsed={_done / 60:.1f}m  eta={_left / 60:.1f}m",
+                  flush=True)
         torch.cuda.empty_cache()
 
     temporal.disable_diagnostics()
