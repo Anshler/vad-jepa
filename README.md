@@ -38,7 +38,6 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 - **K=32 slots**, each with independent Mamba-2 dynamics
 - **Top-k=16** active slots per timestep; inactive slots freeze bit-for-bit
 - **ε-greedy** routing (ε=0.05) during training prevents dead slots
-- **Entropy regularization** (λ=0.01) prevents routing collapse
 - Active slots read from frozen slots via self-attention KV (read-only memory)
 
 ---
@@ -48,12 +47,11 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 | Model | NF | VCL | AUC-ROC |
 |-------|:---:|:---:|:-------:|
 |(Ours)||||
-| **SG-SlotSSM** | 4 | 64 | **85.3%** |
+| **SG-SlotSSM** | 4 | 64 | **85.7%** |
 | **LSTM** | 4 |  64 | 85.1% |
-| **SlotSSM** | 4 |  64 | 85.1% |
+| **SlotSSM** | 4 |  64 | 84.7% |
 | **Mamba** | 4 |  64 | 83.8% |
 | **LSTM** | 4 |  8 | 83.3% |
-| **Encoder-only** | 8 |  — | 81.9% |
 | **Encoder-only** | 4 |  — | 81.5% |
 | (Related works) ||||
 | [**MOVAD**](https://github.com/IMPLabUniPr/movad) | 4 | 8 | 82.2% |
@@ -64,7 +62,7 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 <p align="center">
   <img src="figures/longterm.png" alt="Training curves" width="85%">
   <br>
-  <em>Temporal model training curves on the DoTA benchmark. SG-SlotSSM achieves the best performance at 85.3% AUC.</em>
+  <em>Temporal model training curves on the DoTA benchmark. SG-SlotSSM achieves the best performance at 85.7% AUC.</em>
 </p>
 
 ---
@@ -84,8 +82,8 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 | `vjepa_linear_probe.yaml` | Per-frame MLP | Encoder Only | 28.3M | — | 1.05M | **29.4M** |
 | `vjepa_v1.yaml` | 3-layer LSTM | Recurrent | 28.3M | 25.19M | 1.05M | **54.6M** |
 | `vjepa_mamba.yaml` | Mamba-2 × 3 | SSM | 28.3M | 19.81M | 1.05M | **49.2M** |
-| `vjepa_slotssm.yaml` | SlotSSM | Slot SSM | — | 16.89M | 1.58M | **18.5M** |
-| `vjepa_sparse_slotssm.yaml` | SG-SlotSSM | Slot SSM | — | 16.90M | 1.58M | **18.5M** |
+| `vjepa_slotssm.yaml` | SlotSSM | Slot SSM | — | 16.89M | 1.71M | **18.6M** |
+| `vjepa_sparse_slotssm.yaml` | SG-SlotSSM | Slot SSM | — | 16.90M | 1.71M | **18.6M** |
 
 > *Pre-proj* is the linear projection from the flattened 6×6 spatial grid (27K dim) → temporal input dim. SlotSSM variants avoid this by projecting per-block via cross-attention (768D → 512D).
 
