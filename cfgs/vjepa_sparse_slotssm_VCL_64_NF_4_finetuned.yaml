@@ -12,7 +12,7 @@ amp_dtype: bf16
 balance_weight: 0.0
 batch_size: 32
 checkpoint_key: ema_encoder
-checkpoint_path: /home/chrysenberg/vjepa2-checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
+checkpoint_path: /content/gdrive/MyDrive/vjepa_movad_project/vjepa2-checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
 class_weights:
 - 0.3
 - 0.7
