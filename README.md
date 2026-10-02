@@ -36,7 +36,7 @@ The two-stage pipeline decomposes online VAD into a visual encoder and a tempora
 SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM architecture:
 
 - **K=32 slots**, each with independent Mamba-2 dynamics
-- **Top-k=16** active slots per timestep; inactive slots freeze bit-for-bit
+- **Top-k** active slots per timestep; inactive slots freeze bit-for-bit
 - **ε-greedy** routing (ε=0.05) during training prevents dead slots
 - Active slots read from frozen slots via self-attention KV (read-only memory)
 
