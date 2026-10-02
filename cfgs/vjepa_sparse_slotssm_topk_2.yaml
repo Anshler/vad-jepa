@@ -1,0 +1,128 @@
+# --------------------------------------------------------------------
+# V-JEPA 2.1 + MOVAD — Sparse SlotSSM temporal model  (~21M trainable)
+#
+# K=32 slots × D=512, 4 blocks, top-k=4, Mamba2.  Inactive slots
+# are read-only memory (preserved bit-for-bit across steps); active
+# slots read from them via self-attention KV.  ε-random and entropy
+# regularization prevent dead slots and routing collapse.
+# --------------------------------------------------------------------
+
+# --- V-JEPA 2.1 encoder ---------------------------------------------------
+model_name: vit_base
+img_size: 384
+num_frames: 4
+tubelet_size: 2
+patch_size: 16
+checkpoint_path: /home/chrysenberg/vjepa2-checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
+checkpoint_key: ema_encoder
+vjepa_spatial_grid: [6, 6]
+compile: false
+
+# --- Temporal model -------------------------------------------------------
+temporal_model: sparse_slotssm
+dim_latent: 1024
+dropout: 0.3
+num_slots: 32                       # K — total slot modules
+slot_dim: 512                       # D — (d_model*expand/headdim)=1024/64=16, 16%8=0 ✓
+num_ssm_blocks: 4
+top_k: 2
+eps_random: 0.05                    # ε-random activation (anti-dead-slots)
+balance_weight: 0.0                 # weighted aux loss OFF — kept as an ablation arm;
+                                    # it measures cross-video diversity, not the
+                                    # within-video temporal coverage that fails (§1g)
+recency_lambda: 0.0                 # OFF — measured to HURT AUC (-0.011 at k=4,
+                                    # -0.013 at k=16, paired) and to flip
+                                    # gate-input corr NEGATIVE. See §1j/§1k.
+                                    # Code retained: one-line re-enable for a
+                                    # VCL=64 test of the turnover hypothesis.
+recency_rho: 0.9                    # recency EMA decay (0.5 -> maximal turnover)
+gumbel_sigma: 0.0                   # OFF — measured to do nothing useful (§15.2).
+                                    # It barely moved coverage (dead slots 1.75 ->
+                                    # 1.50 vs eps_random's 1.75 -> 0.00), made
+                                    # static_frac slightly WORSE (0.0796 -> 0.0908),
+                                    # made the cutoff LESS decisive (margin 0.261 ->
+                                    # 0.159, near-tie frames 51% -> 59%), and partly
+                                    # undid eps_random when combined (both: dead 1.25,
+                                    # usage CV 32.1 vs eps alone's 0.00 / 25.8).
+                                    # Mechanistically it can only re-roll among slots
+                                    # already near the cutoff, so it cannot reach a
+                                    # starved slot by construction.  Code retained.
+                                    # 0 = off.  UNVALIDATED effect.
+mamba_d_state: 128
+mamba_d_conv: 4
+mamba_expand: 2
+mamba_version: mamba2
+use_inverted_attention: false        # standard cross-attn (FlashMHA-compatible)
+
+# --- Data -----------------------------------------------------------------
+NF: 4
+VCL: 8
+
+data_mean: [0.5, 0.5, 0.5]
+data_path: ./data/dota
+data_std: [0.5, 0.5, 0.5]
+dataset: Dota
+image_shape: [720, 1280]
+input_shape: [384, 384]
+FPS: 10
+
+# --- Training -------------------------------------------------------------
+batch_size: 32
+class_weights: [0.3, 0.7]
+epochs: 200
+lr: 0.00005
+snapshot_interval: 10
+enable_validation: true
+validation_epoch_step: 10
+num_workers: 4
+
+amp_dtype: bf16                      # bf16 (AMP mixed-precision), fp16, or fp32 (no AMP)
+
+# --- Augmentation ---------------------------------------------------------
+horizontal_flip_prob: 0.5
+vertical_flip_prob: 0.0
+
+# --- Output ---------------------------------------------------------------
+output: ./output
+
+# --- per-slot differentiation: proj ---
+slot_input_proj_rank: 0    # OFF (2026-09-22): the proj arms measured
+                            # WORSE than no-proj at every scale tried
+                            # (findings 16.9.7 / 10.2), so proj-off is
+                            # the default now. The `_proj` variants set
+                            # 32 explicitly and are unaffected.
+
+# --- slot pooling: GATED ATTENTION (default from 2026-09-24) ---------------
+# The classifier's readout over the 32 slots. Until 2026-09-24 this was the
+# implicit 'dot': a bare `nn.Parameter` query whose 0.02 init put the softmax
+# logits within +-0.04, so the "learned attention-pool" measured as an
+# ARITHMETIC MEAN of all 32 slots (pool eff 31.95-31.99 of 32, unchanged after
+# 50 epochs) -- findings 19.1. Replacing it with gated attention pooling
+# (Ilse et al. 2018 Eq. 9) is the fix, and it is the one readout change in this
+# project that beat the control on BOTH metrics, replicated in two independent
+# runs (+0.0064 f-AUC in attention-pool, +0.0090 / +0.0081 mvAUC in
+# positional-encoding) -- findings 19.4 and 22.
+#
+#   GATED ATTENTION (Ilse et al. 2018 Eq. 9)
+#     a_k ~ exp( w^T ( tanh(V h_k) * sigmoid(U h_k) ) ),  h = LayerNorm(slots)
+#     a_k ~ exp( w^T tanh(V h_k) ) ... with slot_pool_gated: false (Eq. 8)
+#     slot_pool: dot      ... the historical mean, now cfgs/*_dotpool.yaml
+#
+# WHY GATED AND NOT THE PLAIN FORM: the plain form is significantly WORSE than
+# mean pooling at scale 1 (+0.0090 to the control) and nominally worse at scale
+# 4; gating is what makes attention pooling viable. The mechanism measured is
+# tanh SATURATION, not the "too linear" problem the paper names -- 42% of
+# pre-tanh activations exceed |a|>1 and ~24% sit at |tanh|>0.9 where the gradient
+# is ~0.03, and tanh has no way to attenuate a saturated element while
+# sigmoid(U h) is exactly that volume knob (findings 19.5).
+#
+# NO TEMPERATURE: MIL pooling carries none, and a tuned constant here would be a
+# non-standard addition needing its own ablation (findings 19.2).
+#
+# CHECKPOINT NOTE: the pool modes have different parameter NAMES, so checkpoints
+# are NOT portable between them (findings 19.2). Existing checkpoints were all
+# trained on 'dot', which is why every pre-2026-09-24 config PINS `slot_pool: dot`
+# explicitly rather than inheriting this default.
+slot_pool: attn
+slot_pool_hidden: 128
+slot_pool_gated: true
