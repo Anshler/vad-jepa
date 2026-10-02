@@ -59,12 +59,6 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 | **DAPT-VideoMAE-B** | 16 | — | 87.9% |
 | **DAPT-VideoMAE-L** | 16 | — | 88.4% |
 
-<p align="center">
-  <img src="figures/longterm.png" alt="Training curves" width="85%">
-  <br>
-  <em>Temporal model training curves on the DoTA benchmark. SG-SlotSSM achieves the best performance at 86.6% AUC.</em>
-</p>
-
 ---
 
 ## What's New
