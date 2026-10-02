@@ -1,4 +1,4 @@
-# RECOVERED from output/vcl-64/vjepa_sparse_slotssm_VCL_64_NF_4_finetuned/cfg.yml by tests/_mk_vcl64_cfgs.py.
+# RECOVERED from output/vcl-64/vjepa_sparse_slotssm_topk_8_VCL_64_NF_4_finetuned/cfg.yml by tests/_mk_vcl64_cfgs.py.
 # The run was launched from a Colab-side config that is not in cfgs/, so this file
 # is the head block the run itself saved -- the authoritative record.
 # `checkpoint_path` is the only edit (repointed at the local encoder copy).
@@ -7,7 +7,7 @@ FPS: 10
 NF: 4
 VCL: 64
 _head_names:
-- vjepa_sparse_slotssm_VCL_64_NF_4_finetuned
+- vjepa_sparse_slotssm_topk_8_VCL_64_NF_4_finetuned
 amp_dtype: bf16
 balance_weight: 0.0
 batch_size: 32
@@ -18,7 +18,7 @@ class_weights:
 - 0.7
 compile: false
 config:
-- cfgs/vjepa_sparse_slotssm.yaml
+- cfgs/vjepa_sparse_slotssm_topk_8.yaml
 data_mean:
 - 0.5
 - 0.5
@@ -67,7 +67,7 @@ slot_pool_gated: true
 slot_pool_hidden: 128
 snapshot_interval: 2
 temporal_model: sparse_slotssm
-top_k: 16
+top_k: 8
 train_encoder: true
 tubelet_size: 2
 use_inverted_attention: false

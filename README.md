@@ -47,7 +47,7 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 | Model | NF | VCL | AUC-ROC |
 |-------|:---:|:---:|:-------:|
 |(Ours)||||
-| **SG-SlotSSM** | 4 | 64 | **85.7%** |
+| **SG-SlotSSM** | 4 | 64 | **86.6%** |
 | **LSTM** | 4 |  64 | 85.1% |
 | **SlotSSM** | 4 |  64 | 84.7% |
 | **Mamba** | 4 |  64 | 83.8% |
@@ -62,7 +62,7 @@ SG-SlotSSM introduces **hard-sparse activation gating** into the SlotSSM archite
 <p align="center">
   <img src="figures/longterm.png" alt="Training curves" width="85%">
   <br>
-  <em>Temporal model training curves on the DoTA benchmark. SG-SlotSSM achieves the best performance at 85.7% AUC.</em>
+  <em>Temporal model training curves on the DoTA benchmark. SG-SlotSSM achieves the best performance at 86.6% AUC.</em>
 </p>
 
 ---

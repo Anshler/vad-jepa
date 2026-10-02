@@ -12,7 +12,7 @@ img_size: 384
 num_frames: 4
 tubelet_size: 2
 patch_size: 16
-checkpoint_path: ./pretrained/vjepa2_1_vitb_dist_vitG_384.pt
+checkpoint_path: /home/chrysenberg/vjepa2-checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
 checkpoint_key: ema_encoder
 vjepa_spatial_grid: [6, 6]
 compile: false
